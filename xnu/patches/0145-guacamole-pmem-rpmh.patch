@@ -1,7 +1,16 @@
 diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
 --- a/bsd/dev/sweet_pmem.c
 +++ b/bsd/dev/sweet_pmem.c
-@@ -401,10 +401,166 @@
+@@ -29,7 +29,8 @@
+ #include <sys/uio.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
++#include <kern/clock.h>
+ #include <machine/machine_routines.h>
+ #include <arm/caches_internal.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+@@ -401,10 +402,166 @@
  done:
      ml_io_unmap(va, GUAC_WLAN_SMMU_SZ);
      return ret;
@@ -168,7 +177,7 @@ diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
  {
  	int err = 0;
  	lck_mtx_lock(&sweet_pmem_lock);
-@@ -432,10 +587,13 @@
+@@ -432,10 +588,13 @@
  		break;
  	}
  	case PMEM_SMC:
