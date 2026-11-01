@@ -1,0 +1,84 @@
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -323,6 +323,8 @@
+     int enabled = 0;
+     PE_parse_boot_argn("sweetwlansmmu", &enabled, sizeof(enabled));
+     if (!enabled) return EPERM;
++    int diag_mode = 0;
++    PE_parse_boot_argn("sweetwlansmmudiag", &diag_mode, sizeof(diag_mode));
+ 
+     vm_offset_t va = ml_io_map_unmappable((vm_offset_t)GUAC_WLAN_SMMU_PA,
+             GUAC_WLAN_SMMU_SZ, VM_WIMG_IO);
+@@ -335,13 +337,19 @@
+     uint64_t pagesz = (id1 & (1u << 31)) ? 0x10000ULL : 0x1000ULL;
+     unsigned shift = ((id1 >> 28) & 7u) + 1u;
+     uint64_t cbbase = (1ULL << shift) * pagesz;
++    printf("GUAC SMMU-DIAG: ID0=%08x ID1=%08x nsmr=%u ncb=%u pg=%llu cbbase=%llu diag=%d\n",
++           id0, id1, nsmr, ncb, (unsigned long long)pagesz,
++           (unsigned long long)cbbase, diag_mode);
+     if (!(id0 & (1u << 27)) || nsmr == 0 || nsmr > GUAC_SMMU_SMR_MAX ||
+         ncb == 0 || ncb > GUAC_SMMU_CB_MAX ||
+         cbbase >= GUAC_WLAN_SMMU_SZ ||
+         cbbase + (uint64_t)ncb * pagesz > GUAC_WLAN_SMMU_SZ ||
+         0xc00ULL + 4ULL*nsmr > pagesz ||
+-        pagesz + 0x800ULL + 4ULL*ncb > cbbase)
++        pagesz + 0x800ULL + 4ULL*ncb > cbbase) {
++        printf("GUAC SMMU-DIAG: bad layout (ERANGE)\n");
++        ret = ERANGE;
+         goto done;
++    }
+ 
+     uint64_t occupied[2] = {0, 0};
+     int free_smr = -1;
+@@ -359,16 +367,28 @@
+         if (((id ^ GUAC_WLAN_SID) & ~mask & 0x7fffu) != 0)
+             continue;
+         /* A matching S2CR has already been allocated: never overwrite it. */
+-        if (type != 0 || cb >= ncb) goto done;
++        if (type != 0 || cb >= ncb) {
++            printf("GUAC SMMU-DIAG: SID already matched, unusable type=%u cb=%u (EEXIST)\n", type, cb);
++            ret = EEXIST;
++            goto done;
++        }
+         uint64_t cboff = cbbase + (uint64_t)cb*pagesz;
+         uint32_t sctlr = guac_as_rd(as, cboff);
+         uint32_t cbar = guac_as_rd(as, pagesz + 4*cb);
+         if (!(sctlr & 1u) && (cbar & 0x1f000u) == 0x1f000u) {
+-            ret = 0; /* existing stage-1-disabled, stage-2-bypass bank */
++            printf("GUAC SMMU-DIAG: existing bypass context cb=%u (diag EALREADY)\n", cb);
++            ret = diag_mode ? EALREADY : 0;
++        } else {
++            printf("GUAC SMMU-DIAG: matching SID but non-bypass context sctlr=%08x cbar=%08x (EACCES)\n",sctlr,cbar);
++            ret = EACCES;
+         }
+         goto done;
+     }
+-    if (free_smr < 0) goto done;
++    if (free_smr < 0) {
++        printf("GUAC SMMU-DIAG: no unoccupied SMR (ENOSPC)\n");
++        ret = ENOSPC;
++        goto done;
++    }
+     int free_cb = -1;
+     for (unsigned c = 0; c < ncb; ++c) {
+         if (occupied[c / 64] & (1ULL << (c % 64))) continue;
+@@ -380,7 +400,18 @@
+             break;
+         }
+     }
+-    if (free_cb < 0) goto done;
++    if (free_cb < 0) {
++        printf("GUAC SMMU-DIAG: no verified unowned context bank (EBUSY)\n");
++        ret = EBUSY;
++        goto done;
++    }
++    if (diag_mode) {
++        /* Diagnostic boot MUST NOT program SMR/S2CR/CB, nor authorize DMA. */
++        printf("GUAC SMMU-DIAG: free SMR=%d CB=%d; would write, but diagnostic veto (EAGAIN)\n",
++               free_smr, free_cb);
++        ret = EAGAIN;
++        goto done;
++    }
+ 
+     /* Configure ONLY unowned entries; exact 0x640 match, no 0x641 wildcard. */
+     unsigned cb = (unsigned)free_cb, idx = (unsigned)free_smr;
