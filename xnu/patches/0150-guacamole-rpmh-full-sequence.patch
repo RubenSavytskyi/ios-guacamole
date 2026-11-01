@@ -1,0 +1,84 @@
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -517,35 +517,51 @@
+     /*
+      * GUAC TWOVOTE: the default is still read-only (errno 35).
+      * sweetwlanvote=1: ldoa1 only, with cleanup validation.
+-     * sweetwlanvote=2: ldoa1, then ldoa7; both use TCS0 sequentially.
++     * sweetwlanvote=2: ldoa1, then ldoa7; TCS0.
++     * sweetwlanvote=5: ldoa1, ldoa7, ldoc2, ldoc11, rfclka2.
++     * Mode 5 is a single, strictly ordered, one-shot bring-up.
++     * It does not authorize modem/DMA/SMMU operations.
+      * This is NOT proof of TCS ownership outside this driver or rail voltage.
+      * On any ambiguous completion/cleanup, fail closed and do not retry.
+      */
+     int vote_mode = 0;
+     PE_parse_boot_argn("sweetwlanvote", &vote_mode, sizeof(vote_mode));
+-    if (vote_mode != 1 && vote_mode != 2) return EAGAIN;
++    if (vote_mode != 1 && vote_mode != 2 && vote_mode != 5) return EAGAIN;
+ 
+     if (version != 0x00010700u || cfg != 0x800c8104u ||
+-        max_tcs != 8 || ncpt != 16 || r->slave != 4 ||
+-        r->n != 3 || r->value[1] != 7 || r->value[2] != 1 ||
+-        r->offset[0] != 0 || r->offset[1] != 8 || r->offset[2] != 4)
++        max_tcs != 8 || ncpt != 16 || r->slave != 4)
+         return EAGAIN;
+ 
+-    int is_first = strcmp(r->res, "ldoa1") == 0 && r->value[0] == 752;
+-    int is_second = strcmp(r->res, "ldoa7") == 0 && r->value[0] == 1800;
+-    if (!is_first && !is_second) return EAGAIN;
+-
+-    /* pm_ioctl holds sweet_pmem_lock, serializing this state and MMIO. */
+-    static unsigned attempted_mask = 0;
+-    static unsigned completed_mask = 0;
+-    if (is_first) {
+-        if (attempted_mask != 0) return EAGAIN;
+-        attempted_mask = 1u;  /* never retry after any failure */
++    /* Exactly five known Command DB VRM resource votes, in order. */
++    static const char * const names[5] = {
++        "ldoa1", "ldoa7", "ldoc2", "ldoc11", "rfclka2"
++    };
++    static const uint32_t volts[4] = {752u, 1800u, 1304u, 3104u};
++    unsigned stage = 5u;
++    for (unsigned i = 0; i < 5u; i++) {
++        if (!strcmp(r->res, names[i])) { stage = i; break; }
++    }
++    if (stage == 5u || (vote_mode == 1 && stage >= 1u) ||
++        (vote_mode == 2 && stage >= 2u)) return EAGAIN;
++    if (stage < 4u) {
++        if (r->n != 3 || r->value[0] != volts[stage] ||
++            r->value[1] != 7u || r->value[2] != 1u ||
++            r->offset[0] != 0u || r->offset[1] != 8u ||
++            r->offset[2] != 4u) return EAGAIN;
+     } else {
+-        if (vote_mode != 2 || attempted_mask != 1u || completed_mask != 1u)
+-            return EAGAIN;
+-        attempted_mask = 3u;  /* never retry second vote after failure */
+-    }
++        if (r->n != 1u || r->offset[0] != 4u ||
++            r->value[0] != 1u) return EAGAIN;
++    }
++
++    /* pm_ioctl holds sweet_pmem_lock. Refuse out-of-order/repeated votes.
++     * Poison sequence on first attempt; only a fully ACKed, clean vote
++     * makes the next stage available. All failures require a reboot. */
++    static unsigned next_stage = 0u;
++    static int in_flight_or_failed = 0;
++    if (in_flight_or_failed || stage != next_stage) return EAGAIN;
++    in_flight_or_failed = 1;
++    printf("GUAC fullvote: BEGIN stage=%u resource=%s addr=0x%x n=%u\n",
++           stage, r->res, r->addr, r->n);
+ 
+     volatile uint8_t *rsc = (volatile uint8_t *)pm_io(GUAC_RSC_TCS_PA);
+     if (!rsc) return ENOMEM;
+@@ -631,7 +647,9 @@
+                r->res);
+         return EIO;
+     }
+-    completed_mask |= is_first ? 1u : 2u;
++    next_stage++;
++    in_flight_or_failed = 0;
++    printf("GUAC fullvote: PASS stage=%u resource=%s\n", stage, r->res);
+     printf("GUAC twovote: %s ACK and cleanup OK\n", r->res);
+     return 0;
+ }
