@@ -1,0 +1,69 @@
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -302,8 +302,21 @@
+ #define GUAC_WLAN_SMMU_PA    0x15000000ULL
+ #define GUAC_WLAN_SMMU_SZ    0x100000ULL
+ #define GUAC_WLAN_SID        0x640u
++#define GUAC_WLAN_SID_MASK   0x1u  /* SM8150 iommus = <&apps_smmu 0x640 0x1> */
+ #define GUAC_SMMU_SMR_MAX    128u
+ #define GUAC_SMMU_CB_MAX     128u
++
++/* Two ARM SMMUv2 stream match filters overlap when they can match any
++ * common 15-bit SID. A more-specific 0x641 filter would conflict with
++ * WLAN's 0x640/0x1 group even though it does not match SID 0x640 alone.
++ * Must refuse overlaps rather than risk stream routing to a foreign CB.
++ */
++static inline bool
++guac_wlan_stream_overlaps(uint32_t existing_sid, uint32_t existing_mask)
++{
++    return (((existing_sid ^ GUAC_WLAN_SID) &
++             ~(existing_mask | GUAC_WLAN_SID_MASK) & 0x7fffu) == 0);
++}
+ 
+ static inline uint32_t
+ guac_as_rd(volatile uint8_t *p, uint64_t off)
+@@ -395,8 +408,18 @@
+             guac_last_smmu_snapshot.cb[cb].flags |= GUAC_SMMU_FLAG_REFERENCED;
+         }
+         unsigned id = smr & 0x7fffu, mask = (smr >> 16) & 0x7fffu;
+-        if (((id ^ GUAC_WLAN_SID) & ~mask & 0x7fffu) != 0)
++        if (!guac_wlan_stream_overlaps(id, mask))
+             continue;
++        /* A narrower, wider or partially overlapping filter may route
++         * WLAN traffic elsewhere. Never insert another conflicting SMR.
++         * Only a matching full 0x640/0x1 WLAN group is eligible for
++         * the existing bypass-context verification below.
++         */
++        if (mask != GUAC_WLAN_SID_MASK ||
++            (id & ~mask) != GUAC_WLAN_SID) {
++            ret = EEXIST;
++            goto done;
++        }
+         /* A matching S2CR has already been allocated: never overwrite it. */
+         if (type != 0 || cb >= ncb) {
+             printf("GUAC SMMU-DIAG: SID already matched, unusable type=%u cb=%u (EEXIST)\n", type, cb);
+@@ -494,15 +517,21 @@
+         goto done;
+     }
+ 
+-    /* Configure ONLY unowned entries; exact 0x640 match, no 0x641 wildcard. */
++    /* Configure ONLY unreferenced, completely reset banks. The DT-mandated
++     * filter covers both 0x640 and 0x641; scan above rejects every overlap.
++     * This remains an EXPERIMENTAL S1-bypass attach, NOT a DMA permission
++     * guarantee: the hypervisor/firmware must separately allow the region.
++     */
+     unsigned cb = (unsigned)free_cb, idx = (unsigned)free_smr;
+     uint64_t cboff = cbbase + (uint64_t)cb*pagesz;
+     guac_as_wr(as, cboff, 0xe0u);                       /* SCTLR.M=0 */
+     guac_as_wr(as, pagesz + 0x800 + 4*cb, 1u);        /* AArch64 */
+     guac_as_wr(as, pagesz + 4*cb, 0x1f000u);          /* S1, S2 bypass */
+     guac_as_wr(as, 0xc00 + 4*idx, cb);                /* S2CR translate via cb */
+-    guac_as_wr(as, 0x800 + 4*idx, (1u << 31) | GUAC_WLAN_SID);
+-    if (guac_as_rd(as, 0x800 + 4*idx) == ((1u << 31) | GUAC_WLAN_SID) &&
++    const uint32_t wlan_smr = (1u << 31) |
++        (GUAC_WLAN_SID_MASK << 16) | GUAC_WLAN_SID;
++    guac_as_wr(as, 0x800 + 4*idx, wlan_smr);
++    if (guac_as_rd(as, 0x800 + 4*idx) == wlan_smr &&
+         (guac_as_rd(as, 0xc00 + 4*idx) & 0x300ffu) == cb &&
+         !(guac_as_rd(as, cboff) & 1u)) {
+         ret = 0;

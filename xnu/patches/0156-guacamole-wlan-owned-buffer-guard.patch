@@ -1,0 +1,175 @@
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -75,6 +75,22 @@
+ 	vm_offset_t va;
+ 	uint64_t pa, size;
+ } pm_alloc[PMEM_LIST_MAX];
++
++/* Independent WLAN-only allocations. Never share slot/ownership with GPU PMEM.
++ * Device IOVA == CPU PA is permitted only after the firmware-installed WLAN
++ * bypass group has been verified. We do not assign or reprogram context banks.
++ */
++#define PMEM_WLAN_MAX_ALLOCS 64
++#define PMEM_WLAN_TOTAL_MAX (128ULL * 1024ULL * 1024ULL)
++#define PMEM_WLAN_ALLOC32 _IOWR('P', 9, struct pmem_alloc)
++#define PMEM_WLAN_FREE _IOW('P', 10, uint64_t)
++static struct {
++    vm_offset_t va;
++    uint64_t pa, size;
++} pm_wlan_allocs[PMEM_WLAN_MAX_ALLOCS];
++static uint64_t pm_wlan_allocated;
++static int pm_wlan_verified;
++
+ static struct {
+ 	vm_offset_t va;
+ 	uint64_t win;
+@@ -287,6 +303,71 @@
+ }
+ 
+ 
++/* WLAN-owned, physically contiguous buffers restricted to the 32-bit
++ * address range required by legacy WMI host-memory requests.
++ * /dev/pmem already performs cache maintenance on CPU reads/writes.
++ * This is NOT an IOVA/page-table allocator: only read-only verified
++ * firmware-provided stage-1-bypass configuration may authorize it.
++ */
++static int
++pm_do_wlan_alloc(struct pmem_alloc *a)
++{
++    int permitted = 0;
++    PE_parse_boot_argn("sweetwlandma", &permitted, sizeof(permitted));
++    if (!permitted || !pm_wlan_verified) return EPERM;
++    if (a->size == 0 || a->size > 16ULL * 1024ULL * 1024ULL ||
++        a->size > (0x100000000ULL - PAGE_MASK)) return EINVAL;
++    vm_size_t size = round_page(a->size);
++    uint64_t align = a->align > PAGE_SIZE ? a->align : PAGE_SIZE;
++    if (!size || align > 0x1000000ULL || (align & (align - 1)) ||
++        size > PMEM_WLAN_TOTAL_MAX - pm_wlan_allocated) return EINVAL;
++    int slot = -1;
++    for (int i = 0; i < PMEM_WLAN_MAX_ALLOCS; i++) {
++        if (!pm_wlan_allocs[i].va) { slot = i; break; }
++    }
++    if (slot < 0) return ENOSPC;
++    vm_offset_t va = 0;
++    ppnum_t max_pnum = (ppnum_t)(atop_64(0x100000000ULL) - 1);
++    if (kmem_alloc_contig(kernel_map, &va, size, PAGE_MASK,
++            max_pnum, (ppnum_t)(atop_64(align) - 1),
++            KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS)
++        return ENOMEM;
++    ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
++    if (!pn) {
++        kmem_free(kernel_map, va, size);
++        return ENOMEM;
++    }
++    uint64_t pa = ptoa_64(pn);
++    if (!pa || pa >= 0x100000000ULL ||
++        (uint64_t)size > 0x100000000ULL - pa) {
++        kmem_free(kernel_map, va, size);
++        return ERANGE;
++    }
++    flush_dcache64((addr64_t)pa, (unsigned)size, TRUE);
++    pm_wlan_allocs[slot].va = va;
++    pm_wlan_allocs[slot].pa = pa;
++    pm_wlan_allocs[slot].size = size;
++    pm_wlan_allocated += size;
++    a->pa = pa;
++    a->size = size;
++    return 0;
++}
++
++static int
++pm_do_wlan_free(uint64_t pa)
++{
++    for (int i = 0; i < PMEM_WLAN_MAX_ALLOCS; i++) {
++        if (pm_wlan_allocs[i].va && pm_wlan_allocs[i].pa == pa) {
++            kmem_free(kernel_map, pm_wlan_allocs[i].va,
++                      (vm_size_t)pm_wlan_allocs[i].size);
++            pm_wlan_allocated -= pm_wlan_allocs[i].size;
++            bzero(&pm_wlan_allocs[i], sizeof(pm_wlan_allocs[i]));
++            return 0;
++        }
++    }
++    return ENOENT;
++}
++
+ /*
+  * EXPERIMENTAL Qualcomm qsmmu-v500 WLAN stream attach (SID 0x640).
+  * Must run AFTER the WLAN clock and firmware have been brought up.
+@@ -323,12 +404,6 @@
+ {
+     return *(volatile uint32_t *)(p + off);
+ }
+-static inline void
+-guac_as_wr(volatile uint8_t *p, uint64_t off, uint32_t val)
+-{
+-    *(volatile uint32_t *)(p + off) = val;
+-    __asm__ volatile ("dsb sy" ::: "memory");
+-}
+ 
+ /* 0154: A bounded snapshot of reads the 0153 audit already performs.
+  * This buffer is NOT a mapping and never authorizes CE DMA. Holding the
+@@ -351,6 +426,7 @@
+ static int
+ guac_wlan_attach(void)
+ {
++    pm_wlan_verified = 0;
+     bzero(&guac_last_smmu_snapshot, sizeof(guac_last_smmu_snapshot));
+     guac_last_smmu_snapshot.version = GUAC_SMMU_SNAP_VERSION;
+     guac_last_smmu_snapshot.free_smr = 0xffffffffu;
+@@ -432,6 +508,7 @@
+         if (!(sctlr & 1u) && (cbar & 0x1f000u) == 0x1f000u) {
+             printf("GUAC SMMU-DIAG: existing bypass context cb=%u (diag EALREADY)\n", cb);
+             ret = diag_mode ? EALREADY : 0;
++            if (ret == 0) pm_wlan_verified = 1;
+         } else {
+             printf("GUAC SMMU-DIAG: matching SID but non-bypass context sctlr=%08x cbar=%08x (EACCES)\n",sctlr,cbar);
+             ret = EACCES;
+@@ -517,29 +594,13 @@
+         goto done;
+     }
+ 
+-    /* Configure ONLY unreferenced, completely reset banks. The DT-mandated
+-     * filter covers both 0x640 and 0x641; scan above rejects every overlap.
+-     * This remains an EXPERIMENTAL S1-bypass attach, NOT a DMA permission
+-     * guarantee: the hypervisor/firmware must separately allow the region.
++    /* Do not claim ownership of a bank just because it looks reset.
++     * An SMMUv2 context bank may be reserved by firmware or another DMA
++     * client without being listed in the non-secure stream table.
++     * Until a firmware-handoff-aware domain driver exists, fail closed.
+      */
+-    unsigned cb = (unsigned)free_cb, idx = (unsigned)free_smr;
+-    uint64_t cboff = cbbase + (uint64_t)cb*pagesz;
+-    guac_as_wr(as, cboff, 0xe0u);                       /* SCTLR.M=0 */
+-    guac_as_wr(as, pagesz + 0x800 + 4*cb, 1u);        /* AArch64 */
+-    guac_as_wr(as, pagesz + 4*cb, 0x1f000u);          /* S1, S2 bypass */
+-    guac_as_wr(as, 0xc00 + 4*idx, cb);                /* S2CR translate via cb */
+-    const uint32_t wlan_smr = (1u << 31) |
+-        (GUAC_WLAN_SID_MASK << 16) | GUAC_WLAN_SID;
+-    guac_as_wr(as, 0x800 + 4*idx, wlan_smr);
+-    if (guac_as_rd(as, 0x800 + 4*idx) == wlan_smr &&
+-        (guac_as_rd(as, 0xc00 + 4*idx) & 0x300ffu) == cb &&
+-        !(guac_as_rd(as, cboff) & 1u)) {
+-        ret = 0;
+-    } else {
+-        /* If verification failed, invalidate the newly added stream entry. */
+-        guac_as_wr(as, 0x800 + 4*idx, 0);
+-        ret = EIO;
+-    }
++    ret = EPERM;
++
+ done:
+     guac_last_smmu_snapshot.result_errno = (uint32_t)ret;
+     ml_io_unmap(va, GUAC_WLAN_SMMU_SZ);
+@@ -823,6 +884,12 @@
+ 	case PMEM_ALLOC32:
+ 		err = pm_do_alloc((struct pmem_alloc *)data, true);
+ 		break;
++    case PMEM_WLAN_ALLOC32:
++        err = pm_do_wlan_alloc((struct pmem_alloc *)data);
++        break;
++    case PMEM_WLAN_FREE:
++        err = pm_do_wlan_free(*(uint64_t *)data);
++        break;
+ 	case _IO('P', 7):
+ 		err = guac_wlan_attach();
+ 		break;

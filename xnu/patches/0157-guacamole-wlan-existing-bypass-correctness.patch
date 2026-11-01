@@ -1,0 +1,82 @@
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -471,6 +471,13 @@
+ 
+     uint64_t occupied[2] = {0, 0};
+     int free_smr = -1;
++    int wlan_smr_index = -1;
++    uint32_t wlan_s2cr = 0;
++    /* Complete the stream-table walk BEFORE authorizing DMA. An exact
++     * group found early does not rule out a later conflicting entry.
++     * Every overlap with the WLAN 0x640/0x1 group must be identical,
++     * and there must be exactly one matching SMR.
++     */
+     for (unsigned i = 0; i < nsmr; ++i) {
+         uint32_t smr = guac_as_rd(as, 0x800 + 4*i);
+         uint32_t s2cr = guac_as_rd(as, 0xc00 + 4*i);
+@@ -486,31 +493,47 @@
+         unsigned id = smr & 0x7fffu, mask = (smr >> 16) & 0x7fffu;
+         if (!guac_wlan_stream_overlaps(id, mask))
+             continue;
+-        /* A narrower, wider or partially overlapping filter may route
+-         * WLAN traffic elsewhere. Never insert another conflicting SMR.
+-         * Only a matching full 0x640/0x1 WLAN group is eligible for
+-         * the existing bypass-context verification below.
+-         */
+         if (mask != GUAC_WLAN_SID_MASK ||
+-            (id & ~mask) != GUAC_WLAN_SID) {
++            (id & ~mask) != GUAC_WLAN_SID ||
++            wlan_smr_index >= 0) {
++            /* Partial/duplicate/overlapping routes are ambiguous. */
+             ret = EEXIST;
+             goto done;
+         }
+-        /* A matching S2CR has already been allocated: never overwrite it. */
+-        if (type != 0 || cb >= ncb) {
+-            printf("GUAC SMMU-DIAG: SID already matched, unusable type=%u cb=%u (EEXIST)\n", type, cb);
+-            ret = EEXIST;
+-            goto done;
+-        }
+-        uint64_t cboff = cbbase + (uint64_t)cb*pagesz;
+-        uint32_t sctlr = guac_as_rd(as, cboff);
+-        uint32_t cbar = guac_as_rd(as, pagesz + 4*cb);
+-        if (!(sctlr & 1u) && (cbar & 0x1f000u) == 0x1f000u) {
+-            printf("GUAC SMMU-DIAG: existing bypass context cb=%u (diag EALREADY)\n", cb);
++        wlan_smr_index = (int)i;
++        wlan_s2cr = s2cr;
++    }
++    if (wlan_smr_index >= 0) {
++        unsigned type = (wlan_s2cr >> 16) & 3u;
++        unsigned cb = wlan_s2cr & 0xffu;
++        /* ARM SMMUv2's S2CR_TYPE_BYPASS does not use a context bank. */
++        if (type == 1u) {
+             ret = diag_mode ? EALREADY : 0;
+             if (ret == 0) pm_wlan_verified = 1;
++            printf("GUAC WLAN: existing S2CR bypass group index=%d rc=%d\n",
++                   wlan_smr_index, ret);
++            goto done;
++        }
++        /* Qualcomm SM8150 may emulate bypass using a translation-routed
++         * S1 context with SCTLR.M=0, S2 bypass. The old code wrongly
++         * insisted on CBAR MEMATTR=0xf; only CBAR.TYPE=1 is required.
++         * Never read an invalid or stage-2-only CB as if it were S1.
++         */
++        if (type != 0u || cb < ns2cb || cb >= ncb) {
++            ret = EACCES;
++            goto done;
++        }
++        uint64_t cboff = cbbase + (uint64_t)cb * pagesz;
++        uint32_t sctlr = guac_as_rd(as, cboff);
++        uint32_t cbar = guac_as_rd(as, pagesz + 4 * cb);
++        if ((sctlr & 1u) == 0 && ((cbar >> 16) & 3u) == 1u) {
++            ret = diag_mode ? EALREADY : 0;
++            if (ret == 0) pm_wlan_verified = 1;
++            printf("GUAC WLAN: existing S1-disabled bypass context cb=%u rc=%d\n",
++                   cb, ret);
+         } else {
+-            printf("GUAC SMMU-DIAG: matching SID but non-bypass context sctlr=%08x cbar=%08x (EACCES)\n",sctlr,cbar);
++            printf("GUAC WLAN: matched route is not bypass-safe: cb=%u SCTLR=%08x CBAR=%08x\n",
++                   cb, sctlr, cbar);
+             ret = EACCES;
+         }
+         goto done;
