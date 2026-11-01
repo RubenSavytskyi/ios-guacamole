@@ -8,7 +8,7 @@ diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
      uint32_t version = rpmh_rd(drv, 0);
      uint32_t major = (version >> 16) & 0xffu;
 -    if (major != 2 && major != 3) return ENODEV;
-+    if (major != 2 && major != 3) return ENXIO; /* 6: RSC version rejected */
++    if (version != 0x00010700u && major != 2 && major != 3) return ENXIO; /* 6: RSC version rejected */
      unsigned cmd_stride = major >= 3 ? GUAC_RSC_CMD_STRIDE_3 : GUAC_RSC_CMD_STRIDE_2;
      unsigned ctl = major >= 3 ? 0x24u : 0x14u;
      unsigned stat = major >= 3 ? 0x28u : 0x18u;
