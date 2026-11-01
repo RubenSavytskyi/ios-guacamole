@@ -1,0 +1,168 @@
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -515,85 +515,125 @@
+     printf("GUAC RPMh diag: version=0x%x major=%u cfg=0x%x max_tcs=%u ncpt=%u\n",
+            version, major, cfg, max_tcs, ncpt);
+     /*
+-     * Separate one-shot experiment on SM8150 RSC 1.7. The default boot is
+-     * still entirely read-only. This cannot be activated without BOTH
+-     * sweetrpmh=1 (existing gate) and sweetwlanvote=1 (new, explicit gate).
+-     * Only ldoa1, only TCS0, only one attempt per boot; all other requests
+-     * continue to return 35. No SMMU, CE DMA, or modem work is added here.
+-     * WARNING: even a single regulator vote can reset or hang the device.
++     * GUAC TWOVOTE: the default is still read-only (errno 35).
++     * sweetwlanvote=1: ldoa1 only, with cleanup validation.
++     * sweetwlanvote=2: ldoa1, then ldoa7; both use TCS0 sequentially.
++     * This is NOT proof of TCS ownership outside this driver or rail voltage.
++     * On any ambiguous completion/cleanup, fail closed and do not retry.
+      */
+-    int allow_one_vote = 0;
+-    PE_parse_boot_argn("sweetwlanvote", &allow_one_vote, sizeof(allow_one_vote));
+-    if (allow_one_vote != 1) return EAGAIN;
++    int vote_mode = 0;
++    PE_parse_boot_argn("sweetwlanvote", &vote_mode, sizeof(vote_mode));
++    if (vote_mode != 1 && vote_mode != 2) return EAGAIN;
+ 
+     if (version != 0x00010700u || cfg != 0x800c8104u ||
+-        max_tcs != 8 || ncpt != 16 ||
+-        strcmp(r->res, "ldoa1") != 0 || r->slave != 4 ||
+-        r->n != 3 || r->value[0] != 752 ||
+-        r->value[1] != 7 || r->value[2] != 1 ||
++        max_tcs != 8 || ncpt != 16 || r->slave != 4 ||
++        r->n != 3 || r->value[1] != 7 || r->value[2] != 1 ||
+         r->offset[0] != 0 || r->offset[1] != 8 || r->offset[2] != 4)
+         return EAGAIN;
+ 
+-    /* pm_ioctl holds sweet_pmem_lock; no second invocation can race here. */
+-    static int one_vote_attempted = 0;
+-    if (one_vote_attempted) return EAGAIN;
+-    one_vote_attempted = 1; /* set before mapping or writing hardware */
++    int is_first = strcmp(r->res, "ldoa1") == 0 && r->value[0] == 752;
++    int is_second = strcmp(r->res, "ldoa7") == 0 && r->value[0] == 1800;
++    if (!is_first && !is_second) return EAGAIN;
++
++    /* pm_ioctl holds sweet_pmem_lock, serializing this state and MMIO. */
++    static unsigned attempted_mask = 0;
++    static unsigned completed_mask = 0;
++    if (is_first) {
++        if (attempted_mask != 0) return EAGAIN;
++        attempted_mask = 1u;  /* never retry after any failure */
++    } else {
++        if (vote_mode != 2 || attempted_mask != 1u || completed_mask != 1u)
++            return EAGAIN;
++        attempted_mask = 3u;  /* never retry second vote after failure */
++    }
+ 
+     volatile uint8_t *rsc = (volatile uint8_t *)pm_io(GUAC_RSC_TCS_PA);
+     if (!rsc) return ENOMEM;
+-    volatile uint8_t *tcs = rsc; /* TCS0 only; TCS1 is never touched */
+-    if (rpmh_rd(rsc, 0) != 1u || /* IRQ enable exactly as measured */
+-        rpmh_rd(rsc, 4) != 0u || /* no pending IRQs */
+-        rpmh_rd(tcs, 0x10u) != 0u || /* wait mask clear */
++    volatile uint8_t *tcs = rsc;  /* TCS0 only; never touch TCS1 */
++    if (rpmh_rd(rsc, 0) != 1u ||
++        rpmh_rd(rsc, 4) != 0u ||
++        rpmh_rd(tcs, 0x10u) != 0u ||
+         rpmh_rd(tcs, ctl) != 0u ||
+         rpmh_rd(tcs, stat) != 1u ||
+         rpmh_rd(tcs, en) != 0u) {
+-        printf("GUAC onevote: TCS0 state changed; refusing write\n");
++        printf("GUAC twovote: %s TCS0 not idle; refusing write\n", r->res);
+         return EBUSY;
+     }
+ 
+-    printf("GUAC onevote: starting ldoa1 base=0x%x n=%u via TCS0\n",
+-           r->addr, r->n);
++    printf("GUAC twovote: begin %s base=0x%x n=%u via TCS0\n",
++           r->res, r->addr, r->n);
+     for (unsigned i = 0; i < r->n; ++i) {
+         unsigned delta = cmd_stride * i;
+         rpmh_wr(tcs, msgid + delta, 8u | (1u << 8) | (1u << 16));
+         rpmh_wr(tcs, addr + delta, r->addr + r->offset[i]);
+         rpmh_wr(tcs, data + delta, r->value[i]);
+     }
+-    /* Match Linux ACTIVE_ONLY TCS programming: no wait bitmap for sync vote;
+-       each command requests an explicit response in its MSGID. */
+-    rpmh_wr(tcs, 0x10u, 0);
+-    rpmh_wr(tcs, en, (1u << r->n) - 1u);
+-    rc = rpmh_sync_write(tcs, ctl, 1u << 16);
++    rpmh_wr(tcs, 0x10u, 0u); /* no wait bitmap for this synchronous vote */
++    rc = rpmh_sync_write(tcs, en, (1u << r->n) - 1u);
++    if (!rc) rc = rpmh_sync_write(tcs, ctl, 1u << 16);
+     if (!rc) rc = rpmh_sync_write(tcs, ctl, (1u << 16) | (1u << 24));
+     if (rc) {
+-        printf("GUAC onevote: trigger failed rc=%d; no cleanup of potentially active TCS\n", rc);
++        printf("GUAC twovote: %s trigger failed rc=%d; no cleanup of potentially active TCS\n",
++               r->res, rc);
+         return rc;
+     }
+ 
+     rc = ETIMEDOUT;
+     for (unsigned t = 0; t < 100000; ++t) {
+-        if (rpmh_rd(rsc, 4) & 1u) { /* IRQ0 completion */
++        if (rpmh_rd(rsc, 4) & 1u) {
+             rc = 0;
+             for (unsigned i = 0; i < r->n; ++i) {
+                 uint32_t status = rpmh_rd(tcs, cmd_status + cmd_stride*i);
+-                if (!(status & (1u << 8)) || !(status & (1u << 16))) rc = EIO;
++                if (!(status & (1u << 8)) || !(status & (1u << 16)))
++                    rc = EIO;
+             }
+             break;
+         }
+         delay(1);
+     }
+     if (rc == ETIMEDOUT) {
+-        /* Fail closed. Do not clear potentially in-flight hardware. Reboot. */
+-        printf("GUAC onevote: timed out; TCS0 left untouched for recovery reboot\n");
++        /* Do not touch potentially active hardware. Reboot for recovery. */
++        printf("GUAC twovote: %s timeout; no TCS cleanup\n", r->res);
+         return rc;
+     }
+-    /* Reclaim only TCS0 once hardware has reported completion. */
+-    rpmh_wr(tcs, en, 0u);
+-    rpmh_wr(tcs, 0x10u, 0u);
+-    rpmh_wr(rsc, 8u, 1u); /* acknowledge only TCS0 interrupt */
+-    printf("GUAC onevote: ldoa1 completion rc=%d\n", rc);
+-    return rc;
++    if (rc != 0) {
++        /* IRQ arrived but command completion was abnormal: fail closed. */
++        printf("GUAC twovote: %s bad command ACK rc=%d; no TCS reuse\n",
++               r->res, rc);
++        return rc;
++    }
++
++    /* Linux RPMh completion order: clear trigger, clear AMC enable,
++     * then command enable, then ACK only our TCS0 interrupt. */
++    uint32_t control = rpmh_rd(tcs, ctl);
++    rc = rpmh_sync_write(tcs, ctl, control & ~(1u << 24));
++    if (!rc) rc = rpmh_sync_write(tcs, ctl,
++                                  control & ~((1u << 24) | (1u << 16)));
++    if (!rc) rc = rpmh_sync_write(tcs, en, 0u);
++    if (rc) {
++        printf("GUAC twovote: %s cleanup failed rc=%d; no TCS reuse\n",
++               r->res, rc);
++        return rc;
++    }
++    rpmh_wr(rsc, 8u, 1u); /* IRQ_CLEAR: TCS0 only */
++    int irq_cleared = 0;
++    for (unsigned t = 0; t < 10000; ++t) {
++        if ((rpmh_rd(rsc, 4) & 1u) == 0u) {
++            irq_cleared = 1;
++            break;
++        }
++        delay(1);
++    }
++    if (!irq_cleared || rpmh_rd(tcs, ctl) != 0u ||
++        rpmh_rd(tcs, en) != 0u || rpmh_rd(tcs, stat) != 1u ||
++        rpmh_rd(tcs, 0x10u) != 0u) {
++        printf("GUAC twovote: %s post-cleanup state mismatch; no TCS reuse\n",
++               r->res);
++        return EIO;
++    }
++    completed_mask |= is_first ? 1u : 2u;
++    printf("GUAC twovote: %s ACK and cleanup OK\n", r->res);
++    return 0;
+ }
+ 
+ static int
