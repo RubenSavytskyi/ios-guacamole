@@ -1,0 +1,91 @@
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -334,14 +334,15 @@
+     /* The first read can still CrashDump if the TCU is inaccessible. */
+     uint32_t id0 = guac_as_rd(as, 0x20), id1 = guac_as_rd(as, 0x24);
+     unsigned nsmr = id0 & 0xffu, ncb = id1 & 0xffu;
++    unsigned ns2cb = (id1 >> 16) & 0xffu; /* stage-2-only CBs */
+     uint64_t pagesz = (id1 & (1u << 31)) ? 0x10000ULL : 0x1000ULL;
+     unsigned shift = ((id1 >> 28) & 7u) + 1u;
+     uint64_t cbbase = (1ULL << shift) * pagesz;
+-    printf("GUAC SMMU-DIAG: ID0=%08x ID1=%08x nsmr=%u ncb=%u pg=%llu cbbase=%llu diag=%d\n",
+-           id0, id1, nsmr, ncb, (unsigned long long)pagesz,
++    printf("GUAC SMMU-DIAG: ID0=%08x ID1=%08x nsmr=%u ncb=%u ns2cb=%u pg=%llu cbbase=%llu diag=%d\n",
++           id0, id1, nsmr, ncb, ns2cb, (unsigned long long)pagesz,
+            (unsigned long long)cbbase, diag_mode);
+     if (!(id0 & (1u << 27)) || nsmr == 0 || nsmr > GUAC_SMMU_SMR_MAX ||
+-        ncb == 0 || ncb > GUAC_SMMU_CB_MAX ||
++        ncb == 0 || ncb > GUAC_SMMU_CB_MAX || ns2cb > ncb ||
+         cbbase >= GUAC_WLAN_SMMU_SZ ||
+         cbbase + (uint64_t)ncb * pagesz > GUAC_WLAN_SMMU_SZ ||
+         0xc00ULL + 4ULL*nsmr > pagesz ||
+@@ -390,19 +391,62 @@
+         goto done;
+     }
+     int free_cb = -1;
+-    for (unsigned c = 0; c < ncb; ++c) {
+-        if (occupied[c / 64] & (1ULL << (c % 64))) continue;
++    unsigned matched_cb = 0, unreferenced_cb = 0, active_cb = 0;
++    unsigned inactive_residual_cb = 0;
++    int sample_cb = -1;
++    uint32_t sample_sctlr = 0, sample_cbar = 0, sample_cba2r = 0;
++    /* NUMS2CB context banks [0, ns2cb) are stage-2-only; never select
++     * one for the stage-1-disabled, stage-2-bypass WLAN configuration. */
++    for (unsigned c = ns2cb; c < ncb; ++c) {
++        if (occupied[c / 64] & (1ULL << (c % 64))) {
++            matched_cb++;
++            continue;
++        }
++        unreferenced_cb++;
+         uint64_t off = cbbase + (uint64_t)c*pagesz;
+-        if (guac_as_rd(as, off) == 0 &&
+-            guac_as_rd(as, pagesz + 4*c) == 0 &&
+-            guac_as_rd(as, pagesz + 0x800 + 4*c) == 0) {
++        uint32_t sctlr = guac_as_rd(as, off);
++        uint32_t cbar = guac_as_rd(as, pagesz + 4*c);
++        uint32_t cba2r = guac_as_rd(as, pagesz + 0x800 + 4*c);
++        if (sctlr == 0 && cbar == 0 && cba2r == 0) {
+             free_cb = (int)c;
+             break;
+         }
++        if (sample_cb < 0) {
++            sample_cb = (int)c;
++            sample_sctlr = sctlr;
++            sample_cbar = cbar;
++            sample_cba2r = cba2r;
++        }
++        if (sctlr != 0) active_cb++;
++        else inactive_residual_cb++;
++    }
++    if (diag_mode) {
++        printf("GUAC SMMU-CB-AUDIT: ncb=%u stage2only=%u referenced=%u unreferenced=%u active=%u inactive-configured=%u clear=%d\n",
++               ncb, ns2cb, matched_cb, unreferenced_cb, active_cb,
++               inactive_residual_cb, free_cb);
++        if (sample_cb >= 0)
++            printf("GUAC SMMU-CB-AUDIT: sample CB%d SCTLR=%08x CBAR=%08x CBA2R=%08x (NOT assumed free)\n",
++                   sample_cb, sample_sctlr, sample_cbar, sample_cba2r);
+     }
+     if (free_cb < 0) {
+-        printf("GUAC SMMU-DIAG: no verified unowned context bank (EBUSY)\n");
+-        ret = EBUSY;
++        /* Only diagnostic mode refines the reported errno. In every case,
++         * return an error and refuse to program any SMMU registers or DMA. */
++        if (diag_mode && ns2cb == ncb) {
++            printf("GUAC SMMU-CB-AUDIT: no S1-capable context banks (ENODEV)\n");
++            ret = ENODEV;
++        } else if (diag_mode && unreferenced_cb == 0) {
++            printf("GUAC SMMU-CB-AUDIT: all S1-capable CBs referenced by valid streams (EBUSY)\n");
++            ret = EBUSY;
++        } else if (diag_mode && inactive_residual_cb != 0) {
++            printf("GUAC SMMU-CB-AUDIT: unreferenced inactive CB has residual configuration (ENOTEMPTY)\n");
++            ret = ENOTEMPTY;
++        } else if (diag_mode && active_cb != 0) {
++            printf("GUAC SMMU-CB-AUDIT: unreferenced CB has nonzero SCTLR (EACCES)\n");
++            ret = EACCES;
++        } else {
++            printf("GUAC SMMU-CB-AUDIT: no verified unowned context bank (EBUSY)\n");
++            ret = EBUSY;
++        }
+         goto done;
+     }
+     if (diag_mode) {
