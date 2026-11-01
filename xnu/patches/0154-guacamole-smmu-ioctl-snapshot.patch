@@ -1,0 +1,107 @@
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -317,9 +317,32 @@
+     __asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
++/* 0154: A bounded snapshot of reads the 0153 audit already performs.
++ * This buffer is NOT a mapping and never authorizes CE DMA. Holding the
++ * existing sweet_pmem mutex serializes producer and consumer ioctls.
++ */
++#define GUAC_SMMU_SNAP_VERSION 1u
++#define GUAC_SMMU_FLAG_REFERENCED 1u
++#define GUAC_SMMU_FLAG_INSPECTED 2u
++struct guac_smmu_cb_snapshot {
++    uint32_t flags, sctlr, cbar, cba2r;
++};
++struct guac_smmu_snapshot {
++    uint32_t version, result_errno, id0, id1;
++    uint32_t nsmr, ncb, ns2cb, free_smr, free_cb;
++    struct guac_smmu_cb_snapshot cb[GUAC_SMMU_CB_MAX];
++};
++#define PMEM_WLAN_SMMU_SNAPSHOT _IOR('P', 8, struct guac_smmu_snapshot)
++static struct guac_smmu_snapshot guac_last_smmu_snapshot;
++
+ static int
+ guac_wlan_attach(void)
+ {
++    bzero(&guac_last_smmu_snapshot, sizeof(guac_last_smmu_snapshot));
++    guac_last_smmu_snapshot.version = GUAC_SMMU_SNAP_VERSION;
++    guac_last_smmu_snapshot.free_smr = 0xffffffffu;
++    guac_last_smmu_snapshot.free_cb = 0xffffffffu;
++    guac_last_smmu_snapshot.result_errno = ENXIO;
+     int enabled = 0;
+     PE_parse_boot_argn("sweetwlansmmu", &enabled, sizeof(enabled));
+     if (!enabled) return EPERM;
+@@ -335,6 +358,11 @@
+     uint32_t id0 = guac_as_rd(as, 0x20), id1 = guac_as_rd(as, 0x24);
+     unsigned nsmr = id0 & 0xffu, ncb = id1 & 0xffu;
+     unsigned ns2cb = (id1 >> 16) & 0xffu; /* stage-2-only CBs */
++    guac_last_smmu_snapshot.id0 = id0;
++    guac_last_smmu_snapshot.id1 = id1;
++    guac_last_smmu_snapshot.nsmr = nsmr;
++    guac_last_smmu_snapshot.ncb = ncb;
++    guac_last_smmu_snapshot.ns2cb = ns2cb;
+     uint64_t pagesz = (id1 & (1u << 31)) ? 0x10000ULL : 0x1000ULL;
+     unsigned shift = ((id1 >> 28) & 7u) + 1u;
+     uint64_t cbbase = (1ULL << shift) * pagesz;
+@@ -362,8 +390,10 @@
+             continue;
+         }
+         unsigned type = (s2cr >> 16) & 3u, cb = s2cr & 0xffu;
+-        if (type == 0 && cb < ncb)
++        if (type == 0 && cb < ncb) {
+             occupied[cb / 64] |= 1ULL << (cb % 64);
++            guac_last_smmu_snapshot.cb[cb].flags |= GUAC_SMMU_FLAG_REFERENCED;
++        }
+         unsigned id = smr & 0x7fffu, mask = (smr >> 16) & 0x7fffu;
+         if (((id ^ GUAC_WLAN_SID) & ~mask & 0x7fffu) != 0)
+             continue;
+@@ -385,6 +415,7 @@
+         }
+         goto done;
+     }
++    guac_last_smmu_snapshot.free_smr = free_smr < 0 ? 0xffffffffu : (uint32_t)free_smr;
+     if (free_smr < 0) {
+         printf("GUAC SMMU-DIAG: no unoccupied SMR (ENOSPC)\n");
+         ret = ENOSPC;
+@@ -407,6 +438,11 @@
+         uint32_t sctlr = guac_as_rd(as, off);
+         uint32_t cbar = guac_as_rd(as, pagesz + 4*c);
+         uint32_t cba2r = guac_as_rd(as, pagesz + 0x800 + 4*c);
++        /* Copy existing reads. No additional MMIO, stream writes or DMA. */
++        guac_last_smmu_snapshot.cb[c].flags |= GUAC_SMMU_FLAG_INSPECTED;
++        guac_last_smmu_snapshot.cb[c].sctlr = sctlr;
++        guac_last_smmu_snapshot.cb[c].cbar = cbar;
++        guac_last_smmu_snapshot.cb[c].cba2r = cba2r;
+         if (sctlr == 0 && cbar == 0 && cba2r == 0) {
+             free_cb = (int)c;
+             break;
+@@ -420,6 +456,7 @@
+         if (sctlr != 0) active_cb++;
+         else inactive_residual_cb++;
+     }
++    guac_last_smmu_snapshot.free_cb = free_cb < 0 ? 0xffffffffu : (uint32_t)free_cb;
+     if (diag_mode) {
+         printf("GUAC SMMU-CB-AUDIT: ncb=%u stage2only=%u referenced=%u unreferenced=%u active=%u inactive-configured=%u clear=%d\n",
+                ncb, ns2cb, matched_cb, unreferenced_cb, active_cb,
+@@ -475,6 +512,7 @@
+         ret = EIO;
+     }
+ done:
++    guac_last_smmu_snapshot.result_errno = (uint32_t)ret;
+     ml_io_unmap(va, GUAC_WLAN_SMMU_SZ);
+     return ret;
+ }
+@@ -759,6 +797,11 @@
+ 	case _IO('P', 7):
+ 		err = guac_wlan_attach();
+ 		break;
++	case PMEM_WLAN_SMMU_SNAPSHOT:
++		/* Read previously captured audit only; NO SMMU MMIO here. */
++		bcopy(&guac_last_smmu_snapshot, data, sizeof(guac_last_smmu_snapshot));
++		err = guac_last_smmu_snapshot.version == GUAC_SMMU_SNAP_VERSION ? 0 : ENOENT;
++		break;
+ 	case PMEM_FREE: {
+ 		uint64_t pa = *(uint64_t *)data;
+ 		err = ENOENT;
