@@ -1,0 +1,77 @@
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -519,38 +519,50 @@
+      * sweetwlanvote=1: ldoa1 only, with cleanup validation.
+      * sweetwlanvote=2: ldoa1, then ldoa7; TCS0.
+      * sweetwlanvote=5: ldoa1, ldoa7, ldoc2, ldoc11, rfclka2.
+-     * Mode 5 is a single, strictly ordered, one-shot bring-up.
+-     * It does not authorize modem/DMA/SMMU operations.
++     * sweetwlanvote=7: above five, then ARC cx[7], mss[9].
++     * ARC selection is verified via Command DB in userland.
++     * Values here are exact observed hardware level indices.
++     * Modes 5 and 7 are strictly ordered, one-shot RPMh sequences.
++     * Modem and WLAN DMA are separately gated by userland/SMMU.
+      * This is NOT proof of TCS ownership outside this driver or rail voltage.
+      * On any ambiguous completion/cleanup, fail closed and do not retry.
+      */
+     int vote_mode = 0;
+     PE_parse_boot_argn("sweetwlanvote", &vote_mode, sizeof(vote_mode));
+-    if (vote_mode != 1 && vote_mode != 2 && vote_mode != 5) return EAGAIN;
++    if (vote_mode != 1 && vote_mode != 2 && vote_mode != 5 && vote_mode != 7) return EAGAIN;
+ 
+     if (version != 0x00010700u || cfg != 0x800c8104u ||
+-        max_tcs != 8 || ncpt != 16 || r->slave != 4)
++        max_tcs != 8 || ncpt != 16)
+         return EAGAIN;
+ 
+-    /* Exactly five known Command DB VRM resource votes, in order. */
+-    static const char * const names[5] = {
+-        "ldoa1", "ldoa7", "ldoc2", "ldoc11", "rfclka2"
++    /* Exactly seven known Command DB votes, in one order. No wildcards. */
++    static const char * const names[7] = {
++        "ldoa1", "ldoa7", "ldoc2", "ldoc11", "rfclka2", "cx.lvl", "mss.lvl"
+     };
+     static const uint32_t volts[4] = {752u, 1800u, 1304u, 3104u};
+-    unsigned stage = 5u;
+-    for (unsigned i = 0; i < 5u; i++) {
++    unsigned stage = 7u;
++    for (unsigned i = 0; i < 7u; i++) {
+         if (!strcmp(r->res, names[i])) { stage = i; break; }
+     }
+-    if (stage == 5u || (vote_mode == 1 && stage >= 1u) ||
+-        (vote_mode == 2 && stage >= 2u)) return EAGAIN;
++    if (stage == 7u || (vote_mode == 1 && stage >= 1u) ||
++        (vote_mode == 2 && stage >= 2u) ||
++        (vote_mode == 5 && stage >= 5u)) return EAGAIN;
+     if (stage < 4u) {
+-        if (r->n != 3 || r->value[0] != volts[stage] ||
++        if (r->slave != 4u || r->n != 3u || r->value[0] != volts[stage] ||
+             r->value[1] != 7u || r->value[2] != 1u ||
+             r->offset[0] != 0u || r->offset[1] != 8u ||
+             r->offset[2] != 4u) return EAGAIN;
++    } else if (stage == 4u) {
++        if (r->slave != 4u || r->n != 1u || r->offset[0] != 4u ||
++            r->value[0] != 1u) return EAGAIN;
+     } else {
+-        if (r->n != 1u || r->offset[0] != 4u ||
+-            r->value[0] != 1u) return EAGAIN;
++        /* Two ARC requests only, as observed from valid on-device cmd-db.
++         * cx.lvl index 7, then mss.lvl index 9; both have offset zero.
++         * Reject unexpected type, values, order, or repeat; never cast
++         * these indices as voltages (ARC hardware level is not mV). */
++        if (vote_mode != 7 || r->slave != 3u || r->n != 1u ||
++            r->offset[0] != 0u ||
++            r->value[0] != (stage == 5u ? 7u : 9u)) return EAGAIN;
+     }
+ 
+     /* pm_ioctl holds sweet_pmem_lock. Refuse out-of-order/repeated votes.
+@@ -560,6 +572,9 @@
+     static int in_flight_or_failed = 0;
+     if (in_flight_or_failed || stage != next_stage) return EAGAIN;
+     in_flight_or_failed = 1;
++    if (stage >= 5u)
++        printf("GUAC ARC guard: stage=%u res=%s hw=%u level=%u addr=0x%x\n",
++               stage, r->res, r->slave, r->value[0], r->addr);
+     printf("GUAC fullvote: BEGIN stage=%u resource=%s addr=0x%x n=%u\n",
+            stage, r->res, r->addr, r->n);
+ 
