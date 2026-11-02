@@ -81,6 +81,23 @@ jobs:
           grep -Fq 'bsd/dev/sweet_pmem.c' dxb/xnu/bsd/conf/files
           grep -Fq 'sweet_pmem_init();' dxb/xnu/bsd/dev/sweet_ufs.c
           grep -Fq 'flame_wlan_init();' dxb/xnu/bsd/dev/sweet_ufs.c
+      - name: Verify NativeAdreno integration
+        if: always()
+        run: |
+          set -eu
+          test -s dxb/xnu/iokit/Kernel/arm/SweetAccelerator.cpp
+          test -s dxb/xnu/iokit/Kernel/arm/NativeAdrenoABI.h
+
+          grep -Fq 'SweetAccelerator.cpp'             dxb/xnu/iokit/conf/files.arm64
+
+          grep -Fq 'SweetAccelerator;'             dxb/xnu/iokit/KernelConfigTables.cpp
+
+          grep -Fq 'class NativeAdrenoUserClient'             dxb/xnu/iokit/Kernel/arm/RedwoodGPU.cpp
+
+          grep -Fq 'kIOUserClientClassKey'             dxb/xnu/iokit/Kernel/arm/SweetAccelerator.cpp
+
+          echo "PASS: NativeAdreno GPU patches integrated"
+
       - name: Package build tree for local compiles
         if: always()
         run: |

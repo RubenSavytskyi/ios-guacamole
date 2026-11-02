@@ -62,12 +62,11 @@ index 000000000..5464cdfb6
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
-index 92f3e265e..6c22c19d2 100644
 --- a/iokit/KernelConfigTables.cpp
 +++ b/iokit/KernelConfigTables.cpp
-@@ -82,6 +82,11 @@ const char * gIOKernelConfigTables =
+@@ -87,6 +87,11 @@
      "     'IOProviderClass' = IOResources;"
-     "     'IOMatchCategory' = SweetBattery;"
+     "     'IOMatchCategory' = AppleMobileFileIntegrity;"
      "   },"
 +    "   {"
 +    "     'IOClass'         = SweetAccelerator;"
@@ -78,14 +77,13 @@ index 92f3e265e..6c22c19d2 100644
      "   {"
      "     'IOClass'         = IOPanicPlatform;"
 diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
-index acc9ae026..fb2450dcb 100644
 --- a/iokit/conf/files.arm64
 +++ b/iokit/conf/files.arm64
-@@ -16,6 +16,7 @@ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitc
+@@ -16,6 +16,7 @@
  iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
  iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
  iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
 +iokit/Kernel/arm/SweetAccelerator.cpp                            optional iokitcpp
- iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
- iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
- iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+ iokit/Kernel/arm/SweetAMFI.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/RedwoodGPU.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/RedwoodWLAN.cpp                                 optional iokitcpp
