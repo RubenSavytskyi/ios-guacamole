@@ -1,0 +1,87 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1897,16 +1897,55 @@
+ static struct { uint64_t start, size; } be_va[1024];
+ static unsigned be_va_count;
+ 
+-/* On-demand L2/L3 tables for CB1, carved from contiguous pages. */
++/*
++ * CB1 has a 4 KiB L1 with four relevant 1 GiB entries (32-bit IOVA).
++ * Stage 7 has already installed L1[0] -> L2 at gpumem + 0x1000.
++ * Allocate distinct L2 tables for L1[1..3] instead of aliasing L1[0].
++ * Each L2 entry covers 2 MiB and points at a separately allocated L3.
++ * The caller holds the existing Redwood GPU lock (or runs before clients start).
++ */
++static vm_offset_t be_l2_kva[4];
+ static uint64_t be_l3_pa[GVA_USER_END >> 21];      /* 0 = none; one L3 covers 2 MB */
+ static vm_offset_t be_l3_kva[GVA_USER_END >> 21];  /* kernel VA of that L3 page */
+ 
+ static uint64_t *
++be_l2_for(uint64_t va, bool create)
++{
++    unsigned l1_index = (unsigned)(va >> 30);
++    if (l1_index >= 4) {
++        return NULL;
++    }
++    if (l1_index == 0) {
++        return (uint64_t *)(gpumem + 0x1000u); /* stage-7 L2 */
++    }
++    if (be_l2_kva[l1_index]) {
++        return (uint64_t *)be_l2_kva[l1_index];
++    }
++    if (!create) {
++        return NULL;
++    }
++    vm_offset_t kva = 0;
++    if (kmem_alloc_contig(kernel_map, &kva, 0x1000u, PAGE_MASK, 0, 0,
++        KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++        return NULL;
++    }
++    ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
++    if (!pn) {
++        return NULL;
++    }
++    uint64_t pa = ptoa_64(pn);
++    be_l2_kva[l1_index] = kva;
++    ((uint64_t *)gpumem)[l1_index] = pa | PTE_TABLE;
++    /* Make the new L1 entry visible to the SMMU page-table walker. */
++    flush_dcache64((addr64_t)gpumem, 0x1000u, FALSE);
++    return (uint64_t *)kva;
++}
++
++static uint64_t *
+ be_l3_for(uint64_t va, bool create)
+ {
+-	/* All client VA lives in [0x1000000, 0xf0000000): one L1 entry (L1[0],
+-	 * 0..1 GB) whose L2 is the stage-7 table at gpumem + 0x1000. Grow only
+-	 * the L3 tables (one per 2 MB), carved as single contiguous pages. */
++	/* The 32-bit client IOVA range spans L1[0..3]. A separate L2 is
++	 * required for each GiB; L3 tables cover individual 2 MiB slots. */
+ 	if (va < 0x200000ull || va >= GVA_USER_END) {
+ 		return NULL;                   /* below the IB/ring block or out of range */
+ 	}
+@@ -1920,6 +1959,10 @@
+ 	if (!create) {
+ 		return NULL;
+ 	}
++	uint64_t *l2 = be_l2_for(va, true);
++	if (l2 == NULL) {
++		return NULL;
++	}
+ 	vm_offset_t kva;
+ 	if (kmem_alloc_contig(kernel_map, &kva, 0x1000u, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+@@ -1930,11 +1973,10 @@
+ 		return NULL;
+ 	}
+ 	uint64_t pa = ptoa_64(pn);
+-	uint64_t *l2 = (uint64_t *)(gpumem + 0x1000u);     /* stage-7 L2 (L1[0]) */
+ 	l2[(va >> 21) & 0x1ffu] = pa | PTE_TABLE;
+ 	be_l3_pa[slot] = pa;
+ 	be_l3_kva[slot] = kva;
+-	flush_dcache64((addr64_t)(gpumem + 0x1000u), 0x1000u, FALSE);
++	flush_dcache64((addr64_t)l2, 0x1000u, FALSE);
+ 	return (uint64_t *)kva;
+ }
+ bool

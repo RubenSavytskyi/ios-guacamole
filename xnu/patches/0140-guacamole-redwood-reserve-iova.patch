@@ -1,0 +1,66 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -10,14 +10,62 @@
+ 			if (be_va[i].size == 0) {
+ 				memmove(&be_va[i], &be_va[i + 1], (--be_va_count - i) * sizeof(be_va[0]));
+ 			}
+ 			return a;
+ 		}
+ 	}
+ 	return 0;
++}
++
++/*
++ * NativeAdreno / Turnip selects an IOVA before BoMap. Reserve that exact
++ * interval from the SAME free list used by RedwoodGPU (CoreAnimation).
++ * Caller must hold the shared GPU-client lock, as for redwood_gpu_address().
++ * Never reuse a range until its GPU fence completes and its PTEs are removed.
++ *
++ * Existing Redwood clients allocate in 64 KiB chunks, so reservations
++ * must be 64 KiB-aligned as well. A future Turnip client can round its BO
++ * reservations up without changing the physical 4 KiB mapping granularity.
++ */
++bool
++redwood_gpu_address_reserve(uint64_t address, uint64_t size)
++{
++	if (size == 0 || (address & 0xffffull) != 0 || (size & 0xffffull) != 0 ||
++	    address < GVA_USER_START || address >= GVA_USER_END ||
++	    size > GVA_USER_END - address) {
++		return false;
++	}
++	for (unsigned i = 0; i < be_va_count; i++) {
++		const uint64_t lo = be_va[i].start;
++		const uint64_t hi = lo + be_va[i].size;
++		const uint64_t stop = address + size;
++		if (address < lo || stop > hi) {
++			continue;
++		}
++		if (address == lo && stop == hi) {
++			memmove(&be_va[i], &be_va[i + 1], (--be_va_count - i) * sizeof(be_va[0]));
++		} else if (address == lo) {
++			be_va[i].start = stop;
++			be_va[i].size = hi - stop;
++		} else if (stop == hi) {
++			be_va[i].size = address - lo;
++		} else {
++			if (be_va_count == sizeof(be_va) / sizeof(be_va[0])) {
++				return false;
++			}
++			memmove(&be_va[i + 2], &be_va[i + 1],
++			    (be_va_count - i - 1) * sizeof(be_va[0]));
++			be_va[i + 1].start = stop;
++			be_va[i + 1].size = hi - stop;
++			be_va[i].size = address - lo;
++			be_va_count++;
++		}
++		return true;
++	}
++	return false;
+ }
+ 
+ void
+ redwood_gpu_address_free(uint64_t address, uint64_t size)
+ {
+ 	unsigned at;
+ 	size = (size + 0xffffull) & ~0xffffull;

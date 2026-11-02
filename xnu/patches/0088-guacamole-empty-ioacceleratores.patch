@@ -23,13 +23,15 @@ index 4251721..bb72c6f 100644
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
  
  class IOMobileFramebufferUserClient : public IOUserClient {
-@@ -229,6 +243,17 @@ AppleCLCD::start(IOService *provider)
+@@ -229,6 +243,19 @@ AppleCLCD::start(IOService *provider)
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u%s\n",
  	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
  	    fScaleUp ? " (scaled up)" : "");
 +	uint32_t accelOn = 1;
++	uint32_t sweetMtl = 0;
 +	(void)PE_parse_boot_argn("sweetaccel", &accelOn, sizeof(accelOn));
-+	IOAcceleratorES *accel = accelOn ? OSTypeAlloc(IOAcceleratorES) : NULL;
++	(void)PE_parse_boot_argn("sweetmtl", &sweetMtl, sizeof(sweetMtl));
++	IOAcceleratorES *accel = (accelOn && sweetMtl != 2) ? OSTypeAlloc(IOAcceleratorES) : NULL;
 +	if (accel != NULL && accel->init()) {
 +		accel->setName("sgx");
 +		if (accel->attach(this)) {
