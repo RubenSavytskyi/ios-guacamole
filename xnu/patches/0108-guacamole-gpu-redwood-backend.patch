@@ -30,7 +30,7 @@ index 97b12fd..ef0c9f5 100644
  void sweet_gpu_probe(void);
  
  #define GCC_PA            0x00100000u
-@@ -1850,6 +1857,355 @@ gpu_stage10(void)
+@@ -1850,6 +1857,378 @@ gpu_stage10(void)
  	return ok;
  }
  
@@ -308,6 +308,29 @@ index 97b12fd..ef0c9f5 100644
 +	printf("SWEET GPU: report %s: fence seq %u done %u rptr %#x wptr %#x RBBM %#x CP_HW_FAULT %#x\n",
 +	    why, be_seqno, be_fence ? *be_fence : 0, grd((vm_offset_t)be_gpu, 0x806),
 +	    be_wptr % RB_DWORDS, grd((vm_offset_t)be_gpu, 0x210), grd((vm_offset_t)be_gpu, 0x821));
++    /* GUAC_SMMU_WALK_V1: read-only software page-table dump. */
++    {
++        uint64_t va = rd64(be_smmu, SMMU_CB1 + 0x060);
++        if (va >= GVA_USER_START && va < GVA_USER_END) {
++            unsigned i1 = (unsigned)(va >> 30);
++            unsigned i2 = (unsigned)((va >> 21) & 511u);
++            unsigned i3 = (unsigned)((va >> 12) & 511u);
++            unsigned slot = (unsigned)(va >> 21);
++            uint64_t *l2 = i1 == 0 ?
++                (uint64_t *)(gpumem + 0x1000u) :
++                (uint64_t *)be_l2_kva[i1];
++            uint64_t *l3 = (uint64_t *)be_l3_kva[slot];
++            printf("SWEET GPU: WALK va=%#llx L1[%u]=%#llx L2[%u]=%#llx L3[%u]=%#llx\n",
++                (unsigned long long)va, i1,
++                (unsigned long long)((uint64_t *)gpumem)[i1],
++                i2, (unsigned long long)(l2 ? l2[i2] : 0),
++                i3, (unsigned long long)(l3 ? l3[i3] : 0));
++            printf("SWEET GPU: WALK TCR=%#x TCR2=%#x TTBR0=%#llx\n",
++                rd(be_smmu, SMMU_CB1 + 0x030),
++                rd(be_smmu, SMMU_CB1 + 0x010),
++                (unsigned long long)rd64(be_smmu, SMMU_CB1 + 0x020));
++        }
++    }
 +}
 +
 +void
