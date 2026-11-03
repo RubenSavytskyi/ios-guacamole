@@ -237,7 +237,7 @@ index 0000000..93189d7
 +		delay_for_interval(GPU_ASK_AGAIN_US, NSEC_PER_USEC);
 +		IOLockLock(gGPULock);
 +	}
-+	if (milliseconds >= 1000 && !gGPUReported) {
++	if (milliseconds >= 100 && !gGPUReported) {
 +		gGPUReported = true;
 +		redwood_gpu_report("no answer");
 +	}
