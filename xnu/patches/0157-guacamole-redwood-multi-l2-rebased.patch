@@ -1,0 +1,76 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1904,7 +1904,48 @@
+ 
+ /* On-demand L2/L3 tables for CB1, carved from contiguous pages. */
+ static uint64_t be_l3_pa[GVA_USER_END >> 21];      /* 0 = none; one L3 covers 2 MB */
+-static vm_offset_t be_l3_kva[GVA_USER_END >> 21];  /* kernel VA of that L3 page */
++static vm_offset_t be_l3_kva[GVA_USER_END >> 21];
++
++/* GUAC_REBASED_MULTI_L2 */
++static vm_offset_t be_l2_kva[4];
++
++static uint64_t *
++be_l2_for(uint64_t va, bool create)
++{
++    unsigned index = (unsigned)(va >> 30);
++
++    if (index >= 4)
++        return NULL;
++
++    if (index == 0)
++        return (uint64_t *)(gpumem + 0x1000u);
++
++    if (be_l2_kva[index])
++        return (uint64_t *)be_l2_kva[index];
++
++    if (!create)
++        return NULL;
++
++    vm_offset_t kva = 0;
++    if (kmem_alloc_contig(kernel_map, &kva, 0x1000u,
++        PAGE_MASK, 0, 0,
++        KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++        VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS)
++        return NULL;
++
++    ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
++    if (!pn)
++        return NULL;
++
++    uint64_t pa = ptoa_64(pn);
++
++    be_l2_kva[index] = kva;
++    ((uint64_t *)gpumem)[index] = pa | PTE_TABLE;
++
++    flush_dcache64((addr64_t)gpumem, 0x1000u, FALSE);
++    return (uint64_t *)kva;
++}
++  /* kernel VA of that L3 page */
+ 
+ static uint64_t *
+ be_l3_for(uint64_t va, bool create)
+@@ -1925,6 +1966,9 @@
+ 	if (!create) {
+ 		return NULL;
+ 	}
++	uint64_t *l2 = be_l2_for(va, true);
++	if (!l2)
++		return NULL;
+ 	vm_offset_t kva;
+ 	if (kmem_alloc_contig(kernel_map, &kva, 0x1000u, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+@@ -1935,11 +1979,10 @@
+ 		return NULL;
+ 	}
+ 	uint64_t pa = ptoa_64(pn);
+-	uint64_t *l2 = (uint64_t *)(gpumem + 0x1000u);     /* stage-7 L2 (L1[0]) */
+ 	l2[(va >> 21) & 0x1ffu] = pa | PTE_TABLE;
+ 	be_l3_pa[slot] = pa;
+ 	be_l3_kva[slot] = kva;
+-	flush_dcache64((addr64_t)(gpumem + 0x1000u), 0x1000u, FALSE);
++	flush_dcache64((addr64_t)l2, 0x1000u, FALSE);
+ 	return (uint64_t *)kva;
+ }
+ 

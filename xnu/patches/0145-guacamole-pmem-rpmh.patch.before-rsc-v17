@@ -1,0 +1,193 @@
+diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -29,7 +29,8 @@
+ #include <sys/uio.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
++#include <kern/clock.h>
+ #include <machine/machine_routines.h>
+ #include <arm/caches_internal.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+@@ -401,10 +402,166 @@
+ done:
+     ml_io_unmap(va, GUAC_WLAN_SMMU_SZ);
+     return ret;
+ }
+ 
++/*
++ * Experimental Guacamole RPMh ACTIVE_ONLY votes through the Apps RSC.
++ * Enabled only by sweetrpmh=1. The RSC driver-2 physical address and TCS
++ * layout MUST match the stock OnePlus device tree before enabling.
++ * Not an implementation of sleep/wake votes or a general RPMh framework.
++ */
++struct pmem_rpmh {
++    char res[16];
++    uint32_t n;
++    uint32_t offset[4];
++    uint32_t value[4];
++    uint32_t addr;    /* cmd-db resolved, validated resource base */
++    uint32_t slave;   /* cmd-db hardware type: 3=ARC, 4=VRM */
++};
++#define PMEM_RPMH _IOW('P', 5, struct pmem_rpmh)
++
++#define GUAC_RSC_DRV2_PA 0x18220000ULL
++#define GUAC_RSC_TCS_PA 0x18220d00ULL
++#define GUAC_RSC_TCS_STRIDE 0x2a0u
++#define GUAC_RSC_CMD_STRIDE_2 0x14u
++#define GUAC_RSC_CMD_STRIDE_3 0x18u
++
++static inline uint32_t
++rpmh_rd(volatile uint8_t *base, unsigned off)
++{
++    return *(volatile uint32_t *)(base + off);
++}
++static inline void
++rpmh_wr(volatile uint8_t *base, unsigned off, uint32_t val)
++{
++    *(volatile uint32_t *)(base + off) = val;
++    __asm__ volatile ("dsb oshst" ::: "memory");
++}
++
++static int
++rpmh_valid_request(const struct pmem_rpmh *r)
++{
++    if (!memchr(r->res, '\0', sizeof(r->res)) || !r->addr || (r->addr & 3u) ||
++        r->n == 0 || r->n > 4 || r->addr > 0xfffffff0u) return EINVAL;
++    int isldo = !strcmp(r->res, "ldoa1") || !strcmp(r->res, "ldoa7") ||
++                !strcmp(r->res, "ldoc2") || !strcmp(r->res, "ldoc11");
++    if (isldo) {
++        if (r->slave != 4 || r->n != 3 || r->offset[0] != 0 ||
++            r->offset[1] != 8 || r->offset[2] != 4 ||
++            r->value[0] < 500 || r->value[0] > 3500 ||
++            r->value[1] != 7 || r->value[2] != 1) return EINVAL;
++    } else if (!strcmp(r->res, "rfclka2")) {
++        if (r->slave != 4 || r->n != 1 ||
++            r->offset[0] != 4 || r->value[0] != 1) return EINVAL;
++    } else if (!strcmp(r->res, "cx.lvl") || !strcmp(r->res, "mss.lvl")) {
++        if (r->slave != 3 || r->n != 1 ||
++            r->offset[0] != 0 || r->value[0] > 63) return EINVAL;
++    } else {
++        return EPERM;
++    }
++    for (unsigned i = 0; i < r->n; ++i) {
++        if (r->offset[i] > 8 || (r->offset[i] & 3) ||
++            r->addr > 0xffffffffu - r->offset[i]) return EINVAL;
++    }
++    return 0;
++}
++
++static int
++rpmh_sync_write(volatile uint8_t *tcs, unsigned off, uint32_t val)
++{
++    rpmh_wr(tcs, off, val);
++    /* Fail closed if a register write isn't observable; bounded polling. */
++    for (unsigned i = 0; i < 10000; ++i) {
++        if (rpmh_rd(tcs, off) == val) return 0;
++        delay(1);
++    }
++    return ETIMEDOUT;
++}
++
++static int
++pm_do_rpmh(struct pmem_rpmh *r)
++{
++    int enabled = 0;
++    PE_parse_boot_argn("sweetrpmh", &enabled, sizeof(enabled));
++    if (!enabled) return EPERM;
++    int rc = rpmh_valid_request(r);
++    if (rc) return rc;
++
++    /* Physical RSC access is opt-in, even reads can crash on this port. */
++    volatile uint8_t *drv = (volatile uint8_t *)pm_io(GUAC_RSC_DRV2_PA);
++    if (!drv) return ENOMEM;
++    uint32_t version = rpmh_rd(drv, 0);
++    uint32_t major = (version >> 16) & 0xffu;
++    if (major != 2 && major != 3) return ENODEV;
++    unsigned cmd_stride = major >= 3 ? GUAC_RSC_CMD_STRIDE_3 : GUAC_RSC_CMD_STRIDE_2;
++    unsigned ctl = major >= 3 ? 0x24u : 0x14u;
++    unsigned stat = major >= 3 ? 0x28u : 0x18u;
++    unsigned en = major >= 3 ? 0x2cu : 0x1cu;
++    unsigned msgid = major >= 3 ? 0x34u : 0x30u;
++    unsigned addr = major >= 3 ? 0x38u : 0x34u;
++    unsigned data = major >= 3 ? 0x3cu : 0x38u;
++    unsigned cmd_status = major >= 3 ? 0x40u : 0x3cu;
++
++    /* Dedicated Apps ACTIVE TCS0 or TCS1; do not overwrite a busy slot. */
++    uint32_t cfg = rpmh_rd(drv, 0x0cu);
++    unsigned max_tcs = (cfg >> 12) & 0x3fu; /* driver ID 2 */
++    unsigned ncpt = (cfg >> 27) & 0x1fu;
++    if (max_tcs < 2 || max_tcs > 32 || ncpt < r->n || ncpt > 16) return ENODEV;
++    volatile uint8_t *rsc = (volatile uint8_t *)pm_io(GUAC_RSC_TCS_PA);
++    if (!rsc) return ENOMEM;
++    if (rpmh_rd(rsc, 4) & 3u) return EBUSY; /* pending IRQ -> owned elsewhere */
++    volatile uint8_t *tcs = NULL;
++    unsigned selected = 0;
++    for (unsigned i = 0; i < 2; ++i) {
++        volatile uint8_t *p = rsc + i * GUAC_RSC_TCS_STRIDE;
++        if (rpmh_rd(p, stat) != 0 &&
++            rpmh_rd(p, en) == 0 &&
++            !(rpmh_rd(p, ctl) & (1u << 16 | 1u << 24))) {
++            tcs = p;
++            selected = i;
++            break;
++        }
++    }
++    if (!tcs) return EBUSY;
++
++    for (unsigned i = 0; i < r->n; ++i) {
++        unsigned delta = cmd_stride * i;
++        rpmh_wr(tcs, msgid + delta, 8u | (1u << 8) | (1u << 16));
++        rpmh_wr(tcs, addr + delta, r->addr + r->offset[i]);
++        rpmh_wr(tcs, data + delta, r->value[i]);
++    }
++    rpmh_wr(tcs, en, (1u << r->n) - 1u);
++    rc = rpmh_sync_write(tcs, ctl, 1u << 16);
++    if (rc) goto done;
++    rpmh_wr(tcs, ctl, (1u << 16) | (1u << 24));
++    rc = ETIMEDOUT;
++    for (unsigned t = 0; t < 100000; ++t) {
++        /* Only accept a completed RSC transaction with every ACK. */
++        if (rpmh_rd(rsc, 4) & (1u << selected)) {
++            rc = 0;
++            for (unsigned i = 0; i < r->n; ++i) {
++                uint32_t status = rpmh_rd(tcs, cmd_status + cmd_stride*i);
++                if (!(status & (1u << 8)) || !(status & (1u << 16))) rc = EIO;
++            }
++            break;
++        }
++        delay(1);
++    }
++done:
++    /* Only clear the TCS/IRQ claimed by this driver; preserve other lanes. */
++    if (rpmh_rd(tcs, ctl) & (1u << 24)) {
++        uint32_t v = rpmh_rd(tcs, ctl) & ~(1u << 24);
++        rpmh_wr(tcs, ctl, v);
++        rpmh_wr(tcs, ctl, v & ~(1u << 16));
++    }
++    rpmh_wr(tcs, en, 0);
++    rpmh_wr(rsc, 8, 1u << selected);
++    printf("GUAC RPMh: %s addr=%x n=%u -> %d\n", r->res, r->addr, r->n, rc);
++    return rc;
++}
++
+ static int
+ pm_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
+ {
+ 	int err = 0;
+ 	lck_mtx_lock(&sweet_pmem_lock);
+@@ -432,10 +588,13 @@
+ 		break;
+ 	}
+ 	case PMEM_SMC:
+ 		pm_smc((struct pmem_smc *)data);
+ 		break;
++	case PMEM_RPMH:
++		err = pm_do_rpmh((struct pmem_rpmh *)data);
++		break;
+ 	case PMEM_LIST: {
+ 		struct pmem_list *l = (struct pmem_list *)data;
+ 		bzero(l, sizeof(*l));
+ 		for (int i = 0; i < PMEM_LIST_MAX; i++) {
+ 			if (pm_alloc[i].va) {

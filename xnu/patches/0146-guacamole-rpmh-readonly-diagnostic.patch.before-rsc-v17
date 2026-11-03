@@ -1,0 +1,88 @@
+diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -490,11 +490,11 @@
+     /* Physical RSC access is opt-in, even reads can crash on this port. */
+     volatile uint8_t *drv = (volatile uint8_t *)pm_io(GUAC_RSC_DRV2_PA);
+     if (!drv) return ENOMEM;
+     uint32_t version = rpmh_rd(drv, 0);
+     uint32_t major = (version >> 16) & 0xffu;
+-    if (major != 2 && major != 3) return ENODEV;
++    if (major != 2 && major != 3) return ENXIO; /* 6: RSC version rejected */
+     unsigned cmd_stride = major >= 3 ? GUAC_RSC_CMD_STRIDE_3 : GUAC_RSC_CMD_STRIDE_2;
+     unsigned ctl = major >= 3 ? 0x24u : 0x14u;
+     unsigned stat = major >= 3 ? 0x28u : 0x18u;
+     unsigned en = major >= 3 ? 0x2cu : 0x1cu;
+     unsigned msgid = major >= 3 ? 0x34u : 0x30u;
+@@ -504,62 +504,19 @@
+ 
+     /* Dedicated Apps ACTIVE TCS0 or TCS1; do not overwrite a busy slot. */
+     uint32_t cfg = rpmh_rd(drv, 0x0cu);
+     unsigned max_tcs = (cfg >> 12) & 0x3fu; /* driver ID 2 */
+     unsigned ncpt = (cfg >> 27) & 0x1fu;
+-    if (max_tcs < 2 || max_tcs > 32 || ncpt < r->n || ncpt > 16) return ENODEV;
+-    volatile uint8_t *rsc = (volatile uint8_t *)pm_io(GUAC_RSC_TCS_PA);
+-    if (!rsc) return ENOMEM;
+-    if (rpmh_rd(rsc, 4) & 3u) return EBUSY; /* pending IRQ -> owned elsewhere */
+-    volatile uint8_t *tcs = NULL;
+-    unsigned selected = 0;
+-    for (unsigned i = 0; i < 2; ++i) {
+-        volatile uint8_t *p = rsc + i * GUAC_RSC_TCS_STRIDE;
+-        if (rpmh_rd(p, stat) != 0 &&
+-            rpmh_rd(p, en) == 0 &&
+-            !(rpmh_rd(p, ctl) & (1u << 16 | 1u << 24))) {
+-            tcs = p;
+-            selected = i;
+-            break;
+-        }
+-    }
+-    if (!tcs) return EBUSY;
+-
+-    for (unsigned i = 0; i < r->n; ++i) {
+-        unsigned delta = cmd_stride * i;
+-        rpmh_wr(tcs, msgid + delta, 8u | (1u << 8) | (1u << 16));
+-        rpmh_wr(tcs, addr + delta, r->addr + r->offset[i]);
+-        rpmh_wr(tcs, data + delta, r->value[i]);
+-    }
+-    rpmh_wr(tcs, en, (1u << r->n) - 1u);
+-    rc = rpmh_sync_write(tcs, ctl, 1u << 16);
+-    if (rc) goto done;
+-    rpmh_wr(tcs, ctl, (1u << 16) | (1u << 24));
+-    rc = ETIMEDOUT;
+-    for (unsigned t = 0; t < 100000; ++t) {
+-        /* Only accept a completed RSC transaction with every ACK. */
+-        if (rpmh_rd(rsc, 4) & (1u << selected)) {
+-            rc = 0;
+-            for (unsigned i = 0; i < r->n; ++i) {
+-                uint32_t status = rpmh_rd(tcs, cmd_status + cmd_stride*i);
+-                if (!(status & (1u << 8)) || !(status & (1u << 16))) rc = EIO;
+-            }
+-            break;
+-        }
+-        delay(1);
+-    }
+-done:
+-    /* Only clear the TCS/IRQ claimed by this driver; preserve other lanes. */
+-    if (rpmh_rd(tcs, ctl) & (1u << 24)) {
+-        uint32_t v = rpmh_rd(tcs, ctl) & ~(1u << 24);
+-        rpmh_wr(tcs, ctl, v);
+-        rpmh_wr(tcs, ctl, v & ~(1u << 16));
+-    }
+-    rpmh_wr(tcs, en, 0);
+-    rpmh_wr(rsc, 8, 1u << selected);
+-    printf("GUAC RPMh: %s addr=%x n=%u -> %d\n", r->res, r->addr, r->n, rc);
+-    return rc;
++    if (max_tcs < 2 || max_tcs > 32 || ncpt < r->n || ncpt > 16) return ERANGE; /* 34: TCS config rejected */
++    /*
++     * Diagnostic-only build: NO TCS register mapping or power writes.
++     * Report which validation stage succeeded through errno in wland.log.
++     * Version failed -> 6; TCS config failed -> 34; both passed -> 35.
++     */
++    printf("GUAC RPMh diag: version=0x%x major=%u cfg=0x%x max_tcs=%u ncpt=%u\n",
++           version, major, cfg, max_tcs, ncpt);
++    return EAGAIN; /* 35: preflight passed; hardware writes deliberately suppressed */
+ }
+ 
+ static int
+ pm_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
+ {

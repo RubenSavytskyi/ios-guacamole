@@ -1,0 +1,400 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 97b12fd..ef0c9f5 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -26,6 +26,8 @@
+  *   CP_SET_SECURE_MODE(0).
+  * sweetgpu=10: stage 9, then an indirect-buffer + fence self-test (the
+  *   Mesa submit path, in the kernel).
++ * sweetgpu=11: stage 10, then keep the GPU running and publish the
++ *   redwood_gpu_* backend + RedwoodGPU user client for Mesa.
+  * It reports how ABL leaves the GPU subsystem: the GCC clocks feeding the
+  * GPU and its GMU, the GPU clock controller's CX/GX power domains (GDSCs)
+  * and branch clocks, the GMU clock source, the speed bin fuse, and whether
+@@ -57,6 +59,7 @@
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
++#include <kern/locks.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+@@ -68,6 +71,10 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern int sweet_cmd_db_aux(const char *res, uint16_t *out, unsigned max, unsigned *count);
++extern lck_grp_t *lck_grp_alloc_init(const char *, lck_grp_attr_t *);
++extern lck_mtx_t *lck_mtx_alloc_init(lck_grp_t *, lck_attr_t *);
++extern void lck_mtx_lock(lck_mtx_t *);
++extern void lck_mtx_unlock(lck_mtx_t *);
+ void sweet_gpu_probe(void);
+ 
+ #define GCC_PA            0x00100000u
+@@ -1850,6 +1857,355 @@ gpu_stage10(void)
+ 	return ok;
+ }
+ 
++/*
++ * ===== Backend: the redwood_gpu_* interface for RedwoodGPU.cpp =====
++ *
++ * Same shape as ios-topaz's TopazAdreno.cpp (HackiOS, APSL 2.0), on our
++ * A640 bring-up: a GPU address-space allocator, CB1 page tables grown on
++ * demand, a ring with per-submission fence numbers written by
++ * CACHE_FLUSH_TS, and the 14 functions RedwoodGPU.cpp calls. Stages 1..10
++ * must have run (sweetgpu>=11 keeps the GPU up and publishes this). The
++ * fence memory is one page at GPU VA 0x01060000; the ring wraps.
++ */
++#define GVA_FENCEMEM      0x01060000ull
++#define GPUMEM_FENCEMEM   0x70000u
++#define GVA_USER_START    0x01100000ull    /* VA given to clients starts here */
++#define GVA_USER_END      0xf0000000ull
++#define RB_DWORDS         (RB_SIZE / 4u)
++
++static vm_offset_t be_gpu, be_smmu;
++static uint32_t be_wptr, be_seqno;
++static volatile uint32_t *be_fence;
++static bool be_ready, be_tables_dirty;
++extern lck_mtx_t *gpu_be_lock;
++lck_mtx_t *gpu_be_lock;
++extern lck_grp_t *gpu_be_grp;
++lck_grp_t *gpu_be_grp;
++
++/* VA free list (merged on free), from darwin-redwood via topaz. */
++static struct { uint64_t start, size; } be_va[1024];
++static unsigned be_va_count;
++
++/* On-demand L2/L3 tables for CB1, carved from contiguous pages. */
++static uint64_t be_l3_pa[GVA_USER_END >> 21]; /* 0 = none; one L3 covers 2 MB */
++
++static uint64_t *
++be_l3_for(uint64_t va, bool create)
++{
++	/* All client VA lives in [0x1000000, 0xf0000000): one L1 entry (L1[0],
++	 * 0..1 GB) whose L2 is the stage-7 table at gpumem + 0x1000. Grow only
++	 * the L3 tables (one per 2 MB), carved as single contiguous pages. */
++	if (va < 0x200000ull || va >= GVA_USER_END) {
++		return NULL;                   /* below the IB/ring block or out of range */
++	}
++	unsigned slot = (unsigned)(va >> 21);
++	if (be_l3_pa[slot]) {
++		return (uint64_t *)(be_l3_pa[slot] - gpumem_pa + gpumem);
++	}
++	if (!create) {
++		return NULL;
++	}
++	vm_offset_t kva;
++	if (kmem_alloc_contig(kernel_map, &kva, 0x1000u, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return NULL;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
++	if (!pn) {
++		return NULL;
++	}
++	uint64_t pa = ptoa_64(pn);
++	uint64_t *l2 = (uint64_t *)(gpumem + 0x1000u);     /* stage-7 L2 (L1[0]) */
++	l2[(va >> 21) & 0x1ffu] = pa | PTE_TABLE;
++	be_l3_pa[slot] = pa;
++	flush_dcache64((addr64_t)(gpumem + 0x1000u), 0x1000u, FALSE);
++	return (uint64_t *)kva;
++}
++
++bool
++redwood_gpu_ready(void)
++{
++	return be_ready;
++}
++
++bool
++redwood_gpu_parameter(uint32_t which, uint64_t *value)
++{
++	switch (which) {
++	case 0x01: *value = 640; return true;                       /* GPU_ID */
++	case 0x02: *value = 0x100000; return true;                  /* GMEM_SIZE (1 MiB) */
++	case 0x03: *value = A640_CHIPID; return true;               /* CHIP_ID */
++	case 0x04: *value = 585000000ull; return true;              /* MAX_FREQ */
++	case 0x05:                                                  /* TIMESTAMP: CP always-on */
++		*value = be_ready ? (((uint64_t)grd((vm_offset_t)be_gpu, 0x981) << 32) |
++		    grd((vm_offset_t)be_gpu, 0x980)) : 0;
++		return true;
++	case 0x06: *value = 0x100000; return true;                  /* GMEM_BASE */
++	case 0x07: *value = 1; return true;                         /* PRIORITIES */
++	case 0x10: *value = 15; return true;                        /* HIGHEST_BANK_BIT (a640) */
++	case 0x12: *value = 6; return true;                         /* UBWC_SWIZZLE */
++	case 0x08: case 0x09: case 0x0a: case 0x11: case 0x13:
++		*value = 0;
++		return true;
++	default:
++		return false;
++	}
++}
++
++uint64_t
++redwood_gpu_address(uint64_t size)
++{
++	size = (size + 0xffffull) & ~0xffffull;
++	for (unsigned i = 0; i < be_va_count; i++) {
++		if (be_va[i].size >= size) {
++			uint64_t a = be_va[i].start;
++			be_va[i].start += size;
++			be_va[i].size -= size;
++			if (be_va[i].size == 0) {
++				memmove(&be_va[i], &be_va[i + 1], (--be_va_count - i) * sizeof(be_va[0]));
++			}
++			return a;
++		}
++	}
++	return 0;
++}
++
++void
++redwood_gpu_address_free(uint64_t address, uint64_t size)
++{
++	unsigned at;
++	size = (size + 0xffffull) & ~0xffffull;
++	for (at = 0; at < be_va_count && be_va[at].start < address; at++) {
++	}
++	if (at > 0 && be_va[at - 1].start + be_va[at - 1].size == address) {
++		be_va[at - 1].size += size;
++		if (at < be_va_count && address + size == be_va[at].start) {
++			be_va[at - 1].size += be_va[at].size;
++			memmove(&be_va[at], &be_va[at + 1], (--be_va_count - at) * sizeof(be_va[0]));
++		}
++	} else if (at < be_va_count && address + size == be_va[at].start) {
++		be_va[at].start = address;
++		be_va[at].size += size;
++	} else if (be_va_count < 1024) {
++		memmove(&be_va[at + 1], &be_va[at], (be_va_count++ - at) * sizeof(be_va[0]));
++		be_va[at].start = address;
++		be_va[at].size = size;
++	}
++}
++
++bool
++redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only)
++{
++	uint64_t *t = be_l3_for(address, true);
++	if (t == NULL) {
++		return false;
++	}
++	t[(address >> 12) & 0x1ffu] = (phys & ~0xfffull) | PTE_AF | PTE_SH_OS | PTE_AP_UNPRIV |
++	    (read_only ? PTE_AP_RO : 0) | PTE_PAGE;
++	be_tables_dirty = true;
++	return true;
++}
++
++static void
++be_tlb_flush(void)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wr(be_smmu, SMMU_CB1 + 0x618, 0);
++	wr(be_smmu, SMMU_CB1 + 0x7f0, 0);
++	wait_bits(be_smmu, SMMU_CB1 + 0x7f4, 1u, false, 1000);
++}
++
++void
++redwood_gpu_mapped(void)
++{
++	if (be_tables_dirty) {
++		be_tables_dirty = false;
++		for (unsigned s = 0; s < (GVA_USER_END >> 21); s++) {
++			if (be_l3_pa[s]) {
++				flush_dcache64((addr64_t)(be_l3_pa[s] - gpumem_pa + gpumem), 0x1000u, FALSE);
++			}
++		}
++		be_tlb_flush();
++	}
++}
++
++void
++redwood_gpu_unmap(uint64_t address, uint64_t size)
++{
++	for (uint64_t off = 0; off < size; off += 0x1000ull) {
++		uint64_t *t = be_l3_for(address + off, false);
++		if (t != NULL) {
++			t[((address + off) >> 12) & 0x1ffu] = 0;
++		}
++	}
++	be_tlb_flush();
++}
++
++void
++redwood_gpu_to_memory(void *start, uint64_t size)
++{
++	if (start != NULL && size != 0) {
++		flush_dcache64((addr64_t)start, (unsigned)size, FALSE);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static uint32_t
++be_ring_free(void)
++{
++	uint32_t r = grd((vm_offset_t)be_gpu, 0x806), w = be_wptr % RB_DWORDS;
++	return (r + RB_DWORDS - w - 1) % RB_DWORDS;
++}
++
++static void
++be_emit(uint32_t v)
++{
++	((volatile uint32_t *)(gpumem + GPUMEM_RB))[be_wptr % RB_DWORDS] = v;
++	be_wptr++;
++}
++
++uint32_t
++redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
++{
++	if (!be_ready || count == 0) {
++		return 0;
++	}
++	uint32_t need = 4u * count + 5u;
++	lck_mtx_lock(gpu_be_lock);
++	for (int spin = 0; be_ring_free() < need && spin < 20000; spin++) {
++		delay(100);
++	}
++	if (be_ring_free() < need) {
++		lck_mtx_unlock(gpu_be_lock);
++		return 0;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		be_emit(pkt7(63, 3));
++		be_emit((uint32_t)addresses[i]);
++		be_emit((uint32_t)(addresses[i] >> 32));
++		be_emit(words[i]);
++	}
++	if (++be_seqno == 0) {
++		be_seqno = 1;
++	}
++	uint32_t fence = be_seqno;
++	be_emit(pkt7(70, 4));
++	be_emit(0x4u | 0x80000000u);                   /* CACHE_FLUSH_TS | IRQ */
++	be_emit((uint32_t)GVA_FENCEMEM);
++	be_emit((uint32_t)(GVA_FENCEMEM >> 32));
++	be_emit(fence);
++	flush_dcache64((addr64_t)(gpumem + GPUMEM_RB), RB_SIZE, FALSE);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	gwr((vm_offset_t)be_gpu, 0x807, be_wptr % RB_DWORDS);
++	lck_mtx_unlock(gpu_be_lock);
++	return fence;
++}
++
++bool
++redwood_gpu_done(uint32_t fence)
++{
++	if (be_fence == NULL) {
++		return true;
++	}
++	flush_dcache64((addr64_t)(gpumem + GPUMEM_FENCEMEM), 0x1000u, FALSE);
++	return (int32_t)(*be_fence - fence) >= 0;
++}
++
++uint32_t
++redwood_gpu_last(void)
++{
++	return be_seqno;
++}
++
++void
++redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
++{
++	*microseconds = 0;
++	*submissions = be_seqno;
++	bzero(by, 7 * sizeof(uint32_t));
++}
++
++void
++redwood_gpu_report(const char *why)
++{
++	printf("SWEET GPU: report %s: fence seq %u done %u rptr %#x wptr %#x RBBM %#x CP_HW_FAULT %#x\n",
++	    why, be_seqno, be_fence ? *be_fence : 0, grd((vm_offset_t)be_gpu, 0x806),
++	    be_wptr % RB_DWORDS, grd((vm_offset_t)be_gpu, 0x210), grd((vm_offset_t)be_gpu, 0x821));
++}
++
++void
++redwood_gpu_stop(void)
++{
++	if (be_ready) {
++		gwr((vm_offset_t)be_gpu, 0x808, 0);
++	}
++	be_ready = false;
++}
++
++/* Real one arrives with RedwoodGPU.cpp (0109); weak stub so 0108 links and
++ * the backend self-test can run on its own. */
++__attribute__((weak)) void RedwoodGPUStart(void);
++__attribute__((weak)) void
++RedwoodGPUStart(void)
++{
++	printf("SWEET GPU: RedwoodGPUStart stub (user client not built yet)\n");
++}
++
++/* Turn the finished stage-10 state into the running backend. */
++static void
++gpu_backend_start(void)
++{
++	be_gpu = ml_io_map(GPU_PA, GPU_SIZE);
++	be_smmu = ml_io_map(SMMU_PA, SMMU_SIZE);
++	be_wptr = grd((vm_offset_t)be_gpu, 0x807);
++	be_seqno = 0;
++	/* fence page at GVA_FENCEMEM */
++	uint64_t *l3 = (uint64_t *)(gpumem + 0x2000u);
++	l3[(GVA_FENCEMEM >> 12) & 0x1ffu] = (gpumem_pa + GPUMEM_FENCEMEM) | PTE_AF | PTE_SH_OS |
++	    PTE_AP_UNPRIV | PTE_PAGE;
++	flush_dcache64((addr64_t)gpumem, GPUMEM_SIZE, FALSE);
++	be_fence = (volatile uint32_t *)(gpumem + GPUMEM_FENCEMEM);
++	*be_fence = 0;
++	be_va_count = 0;
++	redwood_gpu_address_free(GVA_USER_START, GVA_USER_END - GVA_USER_START);
++	gpu_be_grp = lck_grp_alloc_init("sweet-gpu", LCK_GRP_ATTR_NULL);
++	gpu_be_lock = lck_mtx_alloc_init(gpu_be_grp, LCK_ATTR_NULL);
++	be_ready = true;
++	be_tlb_flush();
++
++	/* smoke test through the backend: a client-style IB that writes a word */
++	uint64_t va = redwood_gpu_address(0x2000);
++	vm_offset_t kva;
++	kmem_alloc_contig(kernel_map, &kva, 0x2000u, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
++	uint64_t pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)kva));
++	redwood_gpu_map(va, pa, false);
++	redwood_gpu_map(va + 0x1000, pa + 0x1000, false);
++	redwood_gpu_mapped();
++	uint32_t *ib = (uint32_t *)kva;            /* IB at va */
++	volatile uint32_t *out = (volatile uint32_t *)(kva + 0x1000); /* scratch at va+0x1000 */
++	unsigned n = 0;
++	ib[n++] = pkt7(61, 3);
++	ib[n++] = (uint32_t)(va + 0x1000);
++	ib[n++] = (uint32_t)((va + 0x1000) >> 32);
++	ib[n++] = 0xbeef6400u;
++	*out = 0;
++	redwood_gpu_to_memory((void *)kva, 0x2000);
++	uint64_t ibaddr = va;
++	uint32_t f = redwood_gpu_submit(&ibaddr, &n, 1);
++	unsigned ms = 0;
++	for (; ms < 500 && !redwood_gpu_done(f); ms++) {
++		delay(1000);
++	}
++	flush_dcache64((addr64_t)kva, 0x2000u, FALSE);
++	printf("SWEET GPU: backend self-test: fence %u done=%d out %#x (want beef6400), last %u\n",
++	    f, redwood_gpu_done(f), *out, redwood_gpu_last());
++	redwood_gpu_report("backend ready");
++	RedwoodGPUStart();
++	printf("SWEET GPU: *** Adreno 640 backend published (RedwoodGPU) ***\n");
++}
++
++
+ static unsigned gpu_stage;
+ 
+ static void
+@@ -1906,8 +2262,9 @@ gpu_thread(void *arg, wait_result_t result)
+ 	if (gpu_stage >= 2 && gpu_stage2(gcc, gpucc) && gpu_stage >= 3 && gpu_stage3() &&
+ 	    gpu_stage >= 4 && gpu_stage4() && gpu_stage >= 5 && gpu_stage5() && gpu_stage >= 6 &&
+ 	    gpu_stage6() && gpu_stage >= 7 && gpu_stage7() && gpu_stage >= 8 && gpu_stage8() &&
+-	    gpu_stage >= 9 && gpu_stage9() && gpu_stage >= 10) {
+-		gpu_stage10();
++	    gpu_stage >= 9 && gpu_stage9() && gpu_stage >= 10 && gpu_stage10() &&
++	    gpu_stage >= 11) {
++		gpu_backend_start();
+ 	}
+ out:
+ 	(void)thread_terminate(current_thread());
