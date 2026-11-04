@@ -1,0 +1,212 @@
+diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
+index 25588a3..87ac8d7 100644
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -497,6 +497,12 @@ guac_as_rd(volatile uint8_t *p, uint64_t off)
+     return *(volatile uint32_t *)(p + off);
+ }
+
++static inline void
++guac_as_wr(volatile uint8_t *p, uint64_t off, uint32_t value)
++{
++    *(volatile uint32_t *)(p + off) = value;
++}
++
+ /* 0154: A bounded snapshot of reads the 0153 audit already performs.
+  * This buffer is NOT a mapping and never authorizes CE DMA. Holding the
+  * existing sweet_pmem mutex serializes producer and consumer ioctls.
+@@ -521,6 +527,164 @@ struct guac_smmu_snapshot {
+ #define PMEM_WLAN_SMMU_SNAPSHOT _IOR('P', 8, struct guac_smmu_snapshot)
+ static struct guac_smmu_snapshot guac_last_smmu_snapshot;
+
++/*
++ * 0167: Experimental Qualcomm SMMUv2 bypass-context attachment.
++ * Qualcomm's Linux workaround routes BYPASS through a stage-1 context
++ * with SCTLR.M=0 and CBAR.TYPE=S1_TRANS_S2_BYPASS. Firmware may reserve
++ * the final context bank for this purpose. Nothing in the register dump
++ * proves ownership: this routine only operates with explicit opt-in and
++ * refuses stale banks and active contexts. Shared firmware bypass
++ * contexts may be reused ONLY with sweetwlanreusecb=1, without CB writes.
++ *
++ * A firmware-prepared bypass bank is reused without writing its CB.
++ * Completely zeroed banks may be initialized ONLY with sweetwlancbinit=1.
++ * The stream group is installed into an entirely reset/FAULT SMR slot,
++ * which was inventoried before this helper is called. The global SMMU
++ * configuration and all existing stream entries remain unchanged.
++ *
++ * No DMA is initiated here. The separate kernel DMA gate still applies.
++ */
++static int
++guac_wlan_qcom_cbattach(volatile uint8_t *as,
++        unsigned nsmr, unsigned ncb, unsigned ns2cb,
++        uint64_t cbbase, uint64_t pagesz, int exids,
++        const uint64_t occupied[2],
++        const struct guac_smmu_snapshot *snapshot,
++        uint32_t *out_smr, uint32_t *out_cb)
++{
++    int requested_cb = -1;
++    PE_parse_boot_argn("sweetwlancbindex", &requested_cb,
++            sizeof(requested_cb));
++    /* Qualcomm quirk reserves the last context bank. Explicit override
++     * is useful for one-off recovery tests, but never implies ownership.
++     */
++    unsigned cb = requested_cb < 0 ? ncb - 1u : (unsigned)requested_cb;
++    if (cb < ns2cb || cb >= ncb)
++        return ERANGE;
++    if (snapshot->cb[cb].flags & GUAC_SMMU_FLAG_STALE_ROUTE)
++        return EBUSY;
++    int reused_cb = 0;
++    PE_parse_boot_argn("sweetwlanreusecb", &reused_cb,
++            sizeof(reused_cb));
++    int cb_referenced = (occupied[cb / 64u] & (1ULL << (cb % 64u))) != 0;
++    if (cb_referenced && !reused_cb)
++        return EBUSY;
++
++    const uint64_t cboff = cbbase + (uint64_t)cb * pagesz;
++    const uint64_t cbaroff = pagesz + 4ULL * cb;
++    const uint64_t cba2roff = pagesz + 0x800ULL + 4ULL * cb;
++    const uint32_t sctlr = guac_as_rd(as, cboff);
++    const uint32_t cbar = guac_as_rd(as, cbaroff);
++    const uint32_t cba2r = guac_as_rd(as, cba2roff);
++    /* Do not seize an actively translating or fault-handling context. */
++    if (sctlr != 0u)
++        return EBUSY;
++
++    const int existing_bypass = ((cbar >> 16) & 3u) == 1u;
++    const int blank_cb = (cbar == 0u && cba2r == 0u);
++    int cbinit = 0;
++    PE_parse_boot_argn("sweetwlancbinit", &cbinit, sizeof(cbinit));
++    if (!existing_bypass && !(blank_cb && cbinit && !cb_referenced))
++        return EBUSY;
++
++    /* Find only a reset-like invalid stream slot; never reclaim a stale
++     * SMR, even if its valid bit is clear. Validate every overlap again.
++     */
++    int idx = -1;
++    uint32_t old_s2cr = 0;
++    for (unsigned i = 0; i < nsmr; ++i) {
++        uint32_t smr = guac_as_rd(as, 0x800ULL + 4ULL * i);
++        uint32_t s2cr = guac_as_rd(as, 0xc00ULL + 4ULL * i);
++        int valid = exids ? ((s2cr & GUAC_SMMU_S2CR_EXIDVALID) != 0) :
++                            ((smr & (1u << 31)) != 0);
++        if (valid && guac_wlan_stream_overlaps(smr & 0x7fffu,
++                                                (smr >> 16) & 0x7fffu))
++            return EEXIST;
++        if (!valid && smr == 0u &&
++            (s2cr == 0u || s2cr == (2u << 16)) && idx < 0) {
++            idx = (int)i;
++            old_s2cr = s2cr;
++        }
++    }
++    if (idx < 0)
++        return ENOSPC;
++
++    const uint64_t smroff = 0x800ULL + 4ULL * (unsigned)idx;
++    const uint64_t s2croff = 0xc00ULL + 4ULL * (unsigned)idx;
++    const uint32_t new_smr = (GUAC_WLAN_SID_MASK << 16) | GUAC_WLAN_SID |
++                             (exids ? 0u : (1u << 31));
++    const uint32_t new_s2cr = cb |
++                 (exids ? GUAC_SMMU_S2CR_EXIDVALID : 0u);
++    const uint32_t new_cbar = 1u << 16;
++    int changed_cb = 0;
++
++    /* Recheck targets immediately before writing, including CB contents. */
++    if (guac_as_rd(as, smroff) != 0u ||
++        guac_as_rd(as, s2croff) != old_s2cr ||
++        guac_as_rd(as, cboff) != sctlr ||
++        guac_as_rd(as, cbaroff) != cbar ||
++        guac_as_rd(as, cba2roff) != cba2r)
++        return EBUSY;
++
++    if (!existing_bypass) {
++        /* Disabled stage-1 + stage-2 bypass, as in Qualcomm's quirk.
++         * Never set SCTLR.M and never touch TTBR/page tables.
++         */
++        guac_as_wr(as, cbaroff, new_cbar);
++        __asm__ volatile("dsb sy" ::: "memory");
++        changed_cb = 1;
++        if (guac_as_rd(as, cbaroff) != new_cbar)
++            goto rollback;
++    }
++
++    /* Legacy SMR.VALID: program S2CR action first, then enable SMR.
++     * EXIDS: program SMR first, then S2CR.EXIDVALID last.
++     */
++    if (exids) {
++        guac_as_wr(as, smroff, new_smr);
++        __asm__ volatile("dsb sy" ::: "memory");
++        if (guac_as_rd(as, smroff) != new_smr)
++            goto rollback;
++        guac_as_wr(as, s2croff, new_s2cr);
++    } else {
++        guac_as_wr(as, s2croff, new_s2cr);
++        __asm__ volatile("dsb sy" ::: "memory");
++        if (guac_as_rd(as, s2croff) != new_s2cr)
++            goto rollback;
++        guac_as_wr(as, smroff, new_smr);
++    }
++    __asm__ volatile("dsb sy" ::: "memory");
++    if (guac_as_rd(as, smroff) != new_smr ||
++        guac_as_rd(as, s2croff) != new_s2cr ||
++        guac_as_rd(as, cboff) != 0u ||
++        ((guac_as_rd(as, cbaroff) >> 16) & 3u) != 1u)
++        goto rollback;
++
++    *out_smr = (uint32_t)idx;
++    *out_cb = cb;
++    return 0;
++
++rollback:
++    /* Disable the route's valid bit before restoring either action.
++     * For EXIDS the valid bit is in S2CR; for legacy it is in SMR.
++     */
++    if (exids) {
++        guac_as_wr(as, s2croff, old_s2cr);
++        __asm__ volatile("dsb sy" ::: "memory");
++        guac_as_wr(as, smroff, 0u);
++    } else {
++        guac_as_wr(as, smroff, 0u);
++        __asm__ volatile("dsb sy" ::: "memory");
++        guac_as_wr(as, s2croff, old_s2cr);
++    }
++    __asm__ volatile("dsb sy" ::: "memory");
++    if (changed_cb) {
++        guac_as_wr(as, cbaroff, cbar);
++        __asm__ volatile("dsb sy" ::: "memory");
++    }
++    return EIO;
++}
++
+ static int
+ guac_wlan_attach(void)
+ {
+@@ -741,6 +905,29 @@ guac_wlan_attach(void)
+             printf("GUAC SMMU-CB-AUDIT: sample CB%d SCTLR=%08x CBAR=%08x CBA2R=%08x (NOT assumed free)\n",
+                    sample_cb, sample_sctlr, sample_cbar, sample_cba2r);
+     }
++    /* 0167 opt-in: reuse a firmware-prepared Qualcomm bypass context,
++     * or initialize a totally cleared context with a second explicit opt-in.
++     * The inventory above has already excluded referenced/stale contexts.
++     */
++    if (wlan_cbattach && !diag_mode) {
++        if (!(id0 & (1u << 30)) ||
++            (scr0 & GUAC_SMMU_SCR0_CLIENTPD)) {
++            ret = ENOTSUP;
++            goto done;
++        }
++        uint32_t selected_smr = 0xffffffffu;
++        uint32_t selected_cb = 0xffffffffu;
++        ret = guac_wlan_qcom_cbattach(as, nsmr, ncb, ns2cb,
++                cbbase, pagesz, exids, occupied,
++                &guac_last_smmu_snapshot,
++                &selected_smr, &selected_cb);
++        if (ret == 0) {
++            guac_last_smmu_snapshot.free_smr = selected_smr;
++            guac_last_smmu_snapshot.free_cb = selected_cb;
++            pm_wlan_verified = 1;
++        }
++        goto done;
++    }
+     if (free_cb < 0) {
+         /* Only diagnostic mode refines the reported errno. In every case,
+          * return an error and refuse to program any SMMU registers or DMA. */

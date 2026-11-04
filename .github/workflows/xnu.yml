@@ -81,6 +81,8 @@ jobs:
           grep -Fq 'GUAC_SMMU_FLAG_HANDOFF 4u' dxb/xnu/bsd/dev/sweet_pmem.c
           grep -Fq 'GUAC_SMMU_SCR0_USFCFG' dxb/xnu/bsd/dev/sweet_pmem.c
           grep -Fq 'GUAC_SMMU_S2CR_EXIDVALID' dxb/xnu/bsd/dev/sweet_pmem.c
+          grep -Fq 'guac_wlan_qcom_cbattach' dxb/xnu/bsd/dev/sweet_pmem.c
+          grep -Fq 'sweetwlanreusecb' dxb/xnu/bsd/dev/sweet_pmem.c
           ! grep -Fq 'wlan_cb_rollback:' dxb/xnu/bsd/dev/sweet_pmem.c
           grep -Fq 'bsd/dev/sweet_pmem.c' dxb/xnu/bsd/conf/files
           grep -Fq 'sweet_pmem_init();' dxb/xnu/bsd/dev/sweet_ufs.c
