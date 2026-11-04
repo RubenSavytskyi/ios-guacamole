@@ -1,0 +1,105 @@
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -460,16 +460,27 @@
+  * This opts into a dedicated TRANSLATION-OFF S1 context bank. It NEVER
+  * edits an existing stream/context. It does not make an IOVA mapping or
+  * guarantee that the hypervisor's stage-2 DMA policy permits the stream.
+  */
+ #define GUAC_WLAN_SMMU_PA    0x15000000ULL
+ #define GUAC_WLAN_SMMU_SZ    0x100000ULL
+ #define GUAC_WLAN_SID        0x640u
+ #define GUAC_WLAN_SID_MASK   0x1u  /* SM8150 iommus = <&apps_smmu 0x640 0x1> */
++/* ARM SMMUv2: an unmatched stream bypasses the stream table when
++ * sCR0.USFCFG is clear, provided the client port is enabled.
++ * These are existing firmware values; never modify global sCR0.
++ * Android's apps SMMU DT uses qcom,skip-init; do not reset it here.
++ */
++#define GUAC_SMMU_SCR0                0x0u
++#define GUAC_SMMU_SCR0_CLIENTPD       (1u << 0)
++#define GUAC_SMMU_SCR0_EXIDENABLE     (1u << 3)
++#define GUAC_SMMU_SCR0_USFCFG         (1u << 10)
++#define GUAC_SMMU_ID0_EXIDS           (1u << 8)
++#define GUAC_SMMU_S2CR_EXIDVALID      (1u << 10)
+ #define GUAC_SMMU_SMR_MAX    128u
+ #define GUAC_SMMU_CB_MAX     128u
+
+ /* Two ARM SMMUv2 stream match filters overlap when they can match any
+  * common 15-bit SID. A more-specific 0x641 filter would conflict with
+  * WLAN's 0x640/0x1 group even though it does not match SID 0x640 alone.
+  * Must refuse overlaps rather than risk stream routing to a foreign CB.
+  */
+@@ -551,30 +562,35 @@
+         cbbase + (uint64_t)ncb * pagesz > GUAC_WLAN_SMMU_SZ ||
+         0xc00ULL + 4ULL*nsmr > pagesz ||
+         pagesz + 0x800ULL + 4ULL*ncb > cbbase) {
+         printf("GUAC SMMU-DIAG: bad layout (ERANGE)\n");
+         ret = ERANGE;
+         goto done;
+     }
+
++    uint32_t scr0 = guac_as_rd(as, GUAC_SMMU_SCR0);
++    int exids = ((id0 & GUAC_SMMU_ID0_EXIDS) != 0) &&
++                ((scr0 & GUAC_SMMU_SCR0_EXIDENABLE) != 0);
+     uint64_t occupied[2] = {0, 0};
+     int free_smr = -1;
+     int wlan_smr_index = -1;
+     uint32_t wlan_s2cr = 0;
+     /* Complete the stream-table walk BEFORE authorizing DMA. An exact
+      * group found early does not rule out a later conflicting entry.
+      * Every overlap with the WLAN 0x640/0x1 group must be identical,
+      * and there must be exactly one matching SMR.
+      */
+     for (unsigned i = 0; i < nsmr; ++i) {
+         uint32_t smr = guac_as_rd(as, 0x800 + 4*i);
+         uint32_t s2cr = guac_as_rd(as, 0xc00 + 4*i);
+         unsigned type = (s2cr >> 16) & 3u, cb = s2cr & 0xffu;
+-        int valid = (smr & (1u << 31)) != 0;
++        /* EXIDENABLE changes valid from SMR[31] to S2CR[10]. */
++        int valid = exids ? ((s2cr & GUAC_SMMU_S2CR_EXIDVALID) != 0) :
++                            ((smr & (1u << 31)) != 0);
+         if (valid && type == 0u && cb >= ncb) {
+             ret = ERANGE;
+             goto done;
+         }
+         if (type == 0u && cb < ncb) {
+             if (valid) {
+                 occupied[cb / 64] |= 1ULL << (cb % 64);
+                 guac_last_smmu_snapshot.cb[cb].flags |=
+@@ -630,16 +646,37 @@
+             if (ret == 0) pm_wlan_verified = 1;
+             printf("GUAC WLAN: existing S1-disabled bypass context cb=%u rc=%d\n",
+                    cb, ret);
+         } else {
+             printf("GUAC WLAN: matched route is not bypass-safe: cb=%u SCTLR=%08x CBAR=%08x\n",
+                    cb, sctlr, cbar);
+             ret = EACCES;
+         }
++        goto done;
++    }
++    /*
++     * 0166: reuse an ALREADY-ESTABLISHED, architected default bypass.
++     * With stream matching enabled, no matching valid SMR, and USFCFG=0,
++     * ARM SMMUv2 bypasses the table for unidentified streams. This case
++     * does not allocate a context bank or require a new S2CR entry.
++     *
++     * EXIDS/EXIDENABLE moves validity to S2CR.EXIDVALID. The complete
++     * stream-table walk above handles either format before this fallback.
++     *
++     * This only validates the stage-1 SMMU route, not hypervisor stage-2
++     * access or firmware-side DMA permissions. The separate existing
++     * sweetwlandma opt-in and kernel allocation checks still apply.
++     * Diagnostic mode retains the previous inventory behavior and may
++     * never authorize CE DMA.
++     */
++    if (!diag_mode &&
++        !(scr0 & (GUAC_SMMU_SCR0_CLIENTPD | GUAC_SMMU_SCR0_USFCFG))) {
++        pm_wlan_verified = 1;
++        ret = 0;
+         goto done;
+     }
+     guac_last_smmu_snapshot.free_smr = free_smr < 0 ? 0xffffffffu : (uint32_t)free_smr;
+     if (free_smr < 0) {
+         printf("GUAC SMMU-DIAG: no unoccupied SMR (ENOSPC)\n");
+         ret = ENOSPC;
+         goto done;
+     }
