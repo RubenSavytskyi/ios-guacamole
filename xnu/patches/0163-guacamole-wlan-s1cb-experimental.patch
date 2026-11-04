@@ -1,0 +1,154 @@
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -643,10 +643,13 @@
+      * Enable only with sweetwlannewbypass=1, after the existing full
+      * stream-overlap audit. CE DMA still requires sweetwlandma=1 separately.
+      */
++    int wlan_cbattach = 0;
++    PE_parse_boot_argn("sweetwlancbattach", &wlan_cbattach,
++            sizeof(wlan_cbattach));
+     int new_bypass = 0;
+     PE_parse_boot_argn("sweetwlannewbypass", &new_bypass,
+             sizeof(new_bypass));
+-    if (new_bypass && !diag_mode) {
++    if (new_bypass && !diag_mode && !wlan_cbattach) {
+         /*
+          * EXIDS changes stream-valid handling.
+          * The current SMR audit/writer only supports legacy format.
+@@ -724,6 +727,136 @@
+         __asm__ volatile("dsb sy" ::: "memory");
+         if (guac_as_rd(as, smr_off) != 0 ||
+             guac_as_rd(as, s2cr_off) != old_s2cr)
++            ret = EIO;
++        goto done;
++    }
++
++    /* 0163: opt-in Qualcomm S1-disabled, S2-bypass context experiment.
++     * No DMA authorization is granted here: register readback does not prove
++     * firmware / hypervisor ownership or end-to-end bus accessibility.
++     * Unlike 0159, this routes TYPE_TRANS to a context bank.
++     */
++    if (wlan_cbattach) {
++        int allow_residual = 0;
++        PE_parse_boot_argn("sweetwlanresidualcb", &allow_residual,
++                sizeof(allow_residual));
++        if (diag_mode) { ret = EAGAIN; goto done; }
++        if (new_bypass) { ret = EINVAL; goto done; }
++        /* Current audit/write scheme cannot handle EXIDS. */
++        if ((id0 & (1u << 8)) || !(id0 & (1u << 30))) {
++            ret = ENOTSUP;
++            goto done;
++        }
++        /* Choose only a fully inactive stream slot. */
++        int idx = -1;
++        uint32_t old_s2cr = 0;
++        for (unsigned i = 0; i < nsmr; ++i) {
++            uint32_t smr = guac_as_rd(as, 0x800ULL + 4ULL * i);
++            uint32_t s2cr = guac_as_rd(as, 0xc00ULL + 4ULL * i);
++            if (smr == 0 && (s2cr == 0 || s2cr == (2u << 16))) {
++                idx = (int)i;
++                old_s2cr = s2cr;
++                break;
++            }
++        }
++        if (idx < 0) { ret = ENOSPC; goto done; }
++        /* The stream audit above marked CBs referenced by valid routes. */
++        int cb = -1;
++        uint32_t old_sctlr = 0, old_cbar = 0, old_cba2r = 0;
++        uint64_t bankoff = 0;
++        for (unsigned c = ns2cb; c < ncb; ++c) {
++            if (occupied[c / 64u] & (1ULL << (c % 64u)))
++                continue;
++            uint64_t off = cbbase + (uint64_t)c * pagesz;
++            uint32_t sctlr = guac_as_rd(as, off);
++            uint32_t cbar = guac_as_rd(as, pagesz + 4ULL * c);
++            uint32_t cba2r = guac_as_rd(as, pagesz + 0x800ULL + 4ULL * c);
++            /* Never take an active context. Nonzero inactive configuration
++             * is ALSO not proof of ownership; require separate explicit opt-in.
++             */
++            if (sctlr || (!allow_residual && (cbar || cba2r)))
++                continue;
++            cb = (int)c;
++            bankoff = off;
++            old_sctlr = sctlr;
++            old_cbar = cbar;
++            old_cba2r = cba2r;
++            break;
++        }
++        if (cb < 0) { ret = EBUSY; goto done; }
++
++        const uint64_t smr_off = 0x800ULL + 4ULL * (unsigned)idx;
++        const uint64_t s2cr_off = 0xc00ULL + 4ULL * (unsigned)idx;
++        const uint64_t cbar_off = pagesz + 4ULL * (unsigned)cb;
++        const uint64_t cba2r_off = pagesz + 0x800ULL + 4ULL * (unsigned)cb;
++        const uint32_t new_smr = (1u << 31) |
++                (GUAC_WLAN_SID_MASK << 16) | GUAC_WLAN_SID;
++        /* CBAR.TYPE=S1/S2-bypass, BPSHCFG=NSH, MEMATTR=WB. */
++        const uint32_t new_cbar = (1u << 16) | (3u << 8) | (15u << 12);
++        const uint32_t new_cba2r = 1u; /* AArch64 */
++        /* Qualcomm SCTLR control bits, leaving SCTLR.M=0. */
++        const uint32_t new_sctlr = (3u << 22) | (1u << 12) |
++                (1u << 7) | (1u << 6) | (1u << 5) |
++                (1u << 2) | (1u << 1);
++        const uint32_t new_s2cr = (3u << 8) | (unsigned)cb;
++
++        if (guac_as_rd(as, smr_off) != 0 ||
++            guac_as_rd(as, s2cr_off) != old_s2cr ||
++            guac_as_rd(as, bankoff) != old_sctlr ||
++            guac_as_rd(as, cbar_off) != old_cbar ||
++            guac_as_rd(as, cba2r_off) != old_cba2r) {
++            ret = EBUSY;
++            goto done;
++        }
++        /* Program a disabled S1 context before routing WLAN to it. */
++        guac_as_wr(as, cba2r_off, new_cba2r);
++        guac_as_wr(as, cbar_off, new_cbar);
++        guac_as_wr(as, bankoff, new_sctlr);
++        __asm__ volatile("dsb sy" ::: "memory");
++        if (((guac_as_rd(as, cbar_off) >> 16) & 3u) != 1u ||
++            !(guac_as_rd(as, cba2r_off) & 1u) ||
++            (guac_as_rd(as, bankoff) & 1u) ||
++            ((guac_as_rd(as, bankoff) >> 12) & 1u) != 1u) {
++            ret = EIO;
++            goto wlan_cb_rollback;
++        }
++        guac_as_wr(as, s2cr_off, new_s2cr);
++        __asm__ volatile("dsb sy" ::: "memory");
++        if (((guac_as_rd(as, s2cr_off) >> 16) & 3u) != 0 ||
++            (guac_as_rd(as, s2cr_off) & 0xffu) != (unsigned)cb) {
++            ret = EIO;
++            goto wlan_cb_rollback;
++        }
++        guac_as_wr(as, smr_off, new_smr);
++        __asm__ volatile("dsb sy" ::: "memory");
++        if (guac_as_rd(as, smr_off) != new_smr ||
++            ((guac_as_rd(as, s2cr_off) >> 16) & 3u) != 0 ||
++            (guac_as_rd(as, s2cr_off) & 0xffu) != (unsigned)cb) {
++            ret = EIO;
++            goto wlan_cb_rollback;
++        }
++        guac_last_smmu_snapshot.free_smr = (uint32_t)idx;
++        guac_last_smmu_snapshot.free_cb = (uint32_t)cb;
++        /* EAGAIN means registers accepted but ownership remains unproven.
++         * Do NOT set pm_wlan_verified or start copy-engine DMA.
++         */
++        ret = EAGAIN;
++        goto done;
++
++    wlan_cb_rollback:
++        guac_as_wr(as, smr_off, 0);
++        __asm__ volatile("dsb sy" ::: "memory");
++        guac_as_wr(as, s2cr_off, old_s2cr);
++        guac_as_wr(as, bankoff, 0);
++        guac_as_wr(as, cbar_off, old_cbar);
++        guac_as_wr(as, cba2r_off, old_cba2r);
++        guac_as_wr(as, bankoff, old_sctlr);
++        __asm__ volatile("dsb sy" ::: "memory");
++        if (guac_as_rd(as, smr_off) != 0 ||
++            guac_as_rd(as, s2cr_off) != old_s2cr ||
++            guac_as_rd(as, cbar_off) != old_cbar ||
++            guac_as_rd(as, cba2r_off) != old_cba2r ||
++            guac_as_rd(as, bankoff) != old_sctlr)
+             ret = EIO;
+         goto done;
+     }
