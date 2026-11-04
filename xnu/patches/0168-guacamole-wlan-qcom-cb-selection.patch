@@ -1,0 +1,96 @@
+diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -556,17 +556,57 @@
+     PE_parse_boot_argn("sweetwlancbindex", &requested_cb,
+             sizeof(requested_cb));
+-    /* Qualcomm quirk reserves the last context bank. Explicit override
+-     * is useful for one-off recovery tests, but never implies ownership.
+-     */
+-    unsigned cb = requested_cb < 0 ? ncb - 1u : (unsigned)requested_cb;
+-    if (cb < ns2cb || cb >= ncb)
+-        return ERANGE;
+-    if (snapshot->cb[cb].flags & GUAC_SMMU_FLAG_STALE_ROUTE)
+-        return EBUSY;
+     int reused_cb = 0;
+     PE_parse_boot_argn("sweetwlanreusecb", &reused_cb,
+             sizeof(reused_cb));
+-    int cb_referenced = (occupied[cb / 64u] & (1ULL << (cb % 64u))) != 0;
+-    if (cb_referenced && !reused_cb)
++    int cbinit = 0;
++    PE_parse_boot_argn("sweetwlancbinit", &cbinit, sizeof(cbinit));
++    if (requested_cb < -1 ||
++        (requested_cb >= 0 && ((unsigned)requested_cb < ns2cb ||
++                               (unsigned)requested_cb >= ncb)))
++        return ERANGE;
++
++    /* 0168: choose only eligible firmware bypass or blank contexts.
++     * Prefer an already-configured S1-disabled bypass over initializing
++     * a blank CB, and try the Qualcomm last bank first in either class.
++     * Explicit sweetwlancbindex tests only that selected bank.
++     * Neither a zeroed CB nor a register read is proof of ownership.
++     */
++    unsigned cb = ncb;
++    uint32_t sctlr = 0, cbar = 0, cba2r = 0;
++    int existing_bypass = 0;
++    for (unsigned pass = 0; pass < 2 && cb == ncb; ++pass) {
++        unsigned count = requested_cb >= 0 ? 1u : ncb - ns2cb;
++        for (unsigned candidate = 0; candidate < count; ++candidate) {
++            unsigned c = requested_cb >= 0 ? (unsigned)requested_cb :
++                         ncb - 1u - candidate;
++            if (snapshot->cb[c].flags & GUAC_SMMU_FLAG_STALE_ROUTE)
++                continue;
++            int referenced =
++                (occupied[c / 64u] & (1ULL << (c % 64u))) != 0;
++            if (referenced && !reused_cb)
++                continue;
++            const uint64_t off = cbbase + (uint64_t)c * pagesz;
++            uint32_t csctlr = guac_as_rd(as, off);
++            uint32_t ccbar = guac_as_rd(as, pagesz + 4ULL * c);
++            uint32_t ccba2r = guac_as_rd(as, pagesz + 0x800ULL + 4ULL * c);
++            /* Stage-1 translation must be disabled (SCTLR.M == 0).
++             * Other SCTLR control bits can be set by the firmware.
++             */
++            if (csctlr & 1u)
++                continue;
++            int prepared = ((ccbar >> 16) & 3u) == 1u;
++            int blank = csctlr == 0u && ccbar == 0u && ccba2r == 0u;
++            if (pass == 0 ? !prepared :
++                    !(blank && cbinit && !referenced))
++                continue;
++            cb = c;
++            sctlr = csctlr;
++            cbar = ccbar;
++            cba2r = ccba2r;
++            existing_bypass = prepared;
++            break;
++        }
++    }
++    if (cb == ncb)
+         return EBUSY;
+
+@@ -574,17 +614,4 @@
+     const uint64_t cbaroff = pagesz + 4ULL * cb;
+     const uint64_t cba2roff = pagesz + 0x800ULL + 4ULL * cb;
+-    const uint32_t sctlr = guac_as_rd(as, cboff);
+-    const uint32_t cbar = guac_as_rd(as, cbaroff);
+-    const uint32_t cba2r = guac_as_rd(as, cba2roff);
+-    /* Do not seize an actively translating or fault-handling context. */
+-    if (sctlr != 0u)
+-        return EBUSY;
+-
+-    const int existing_bypass = ((cbar >> 16) & 3u) == 1u;
+-    const int blank_cb = (cbar == 0u && cba2r == 0u);
+-    int cbinit = 0;
+-    PE_parse_boot_argn("sweetwlancbinit", &cbinit, sizeof(cbinit));
+-    if (!existing_bypass && !(blank_cb && cbinit && !cb_referenced))
+-        return EBUSY;
+
+     /* Find only a reset-like invalid stream slot; never reclaim a stale
+@@ -657,5 +684,5 @@
+     if (guac_as_rd(as, smroff) != new_smr ||
+         guac_as_rd(as, s2croff) != new_s2cr ||
+-        guac_as_rd(as, cboff) != 0u ||
++        (guac_as_rd(as, cboff) & 1u) != 0u ||
+         ((guac_as_rd(as, cbaroff) >> 16) & 3u) != 1u)
+         goto rollback;
