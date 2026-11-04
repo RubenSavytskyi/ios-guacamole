@@ -1,0 +1,215 @@
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -502,0 +503,6 @@
++/* 0165: additive flags, preserving the existing snapshot ioctl ABI. */
++#define GUAC_SMMU_FLAG_HANDOFF       4u  /* pre-existing valid TRANS route */
++#define GUAC_SMMU_FLAG_STALE_ROUTE   8u  /* invalid SMR with residual TRANS S2CR */
++#define GUAC_SMMU_FLAG_S2_ONLY      16u
++#define GUAC_SMMU_FLAG_UNREFERENCED 32u  /* NOT proof of ownership */
++#define GUAC_SMMU_FLAG_RESIDUAL     64u  /* non-reset context registers */
+@@ -559,0 +566,5 @@
++    /* Qualcomm handoff inventory, never a writable-bank allocator.
++     * Valid TRANS streams reserve their CBs, as arm_smmu_handoff_cbs() does.
++     * Residual invalid SMR/S2CR pairs are conservatively reserved too.
++     * Software discovery cannot prove that an unreferenced bank is unowned.
++     */
+@@ -560,0 +572,2 @@
++    unsigned valid_handoff_routes = 0;
++    unsigned stale_trans_routes = 0;
+@@ -572 +585,22 @@
+-        if (!(smr & (1u << 31))) {
++        unsigned type = (s2cr >> 16) & 3u, cb = s2cr & 0xffu;
++        int smr_valid = (smr & (1u << 31)) != 0;
++        if (type == 0u && smr_valid && cb >= ncb) {
++            /* Malformed firmware handoff: do not allocate anything. */
++            ret = ERANGE;
++            goto done;
++        }
++        if (type == 0u && cb < ncb) {
++            if (smr_valid) {
++                occupied[cb / 64] |= 1ULL << (cb % 64);
++                guac_last_smmu_snapshot.cb[cb].flags |=
++                    GUAC_SMMU_FLAG_REFERENCED | GUAC_SMMU_FLAG_HANDOFF;
++                valid_handoff_routes++;
++            } else if (smr != 0u || s2cr != 0u) {
++                /* Not an active route, but cannot prove bank reclaimable. */
++                occupied[cb / 64] |= 1ULL << (cb % 64);
++                guac_last_smmu_snapshot.cb[cb].flags |=
++                    GUAC_SMMU_FLAG_STALE_ROUTE;
++                stale_trans_routes++;
++            }
++        }
++        if (!smr_valid) {
+@@ -575,5 +608,0 @@
+-        }
+-        unsigned type = (s2cr >> 16) & 3u, cb = s2cr & 0xffu;
+-        if (type == 0 && cb < ncb) {
+-            occupied[cb / 64] |= 1ULL << (cb % 64);
+-            guac_last_smmu_snapshot.cb[cb].flags |= GUAC_SMMU_FLAG_REFERENCED;
+@@ -734,4 +763,5 @@
+-    /* 0163: opt-in Qualcomm S1-disabled, S2-bypass context experiment.
+-     * No DMA authorization is granted here: register readback does not prove
+-     * firmware / hypervisor ownership or end-to-end bus accessibility.
+-     * Unlike 0159, this routes TYPE_TRANS to a context bank.
++    /* 0165: The old 0163 write-and-rollback experiment was not an
++     * ownership protocol. Do not program an unreferenced context bank,
++     * even when its registers look reset or the user opts in.
++     * Both normal and diagnostic paths fall through to the read-only
++     * handoff inventory. sweetwlancbattach no longer enables writes.
+@@ -743 +772,0 @@
+-        if (diag_mode) { ret = EAGAIN; goto done; }
+@@ -746,117 +775 @@
+-        /* Current audit/write scheme cannot handle EXIDS. */
+-        if ((id0 & (1u << 8)) || !(id0 & (1u << 30))) {
+-            ret = ENOTSUP;
+-            goto done;
+-        }
+-        /* Choose only a fully inactive stream slot. */
+-        int idx = -1;
+-        uint32_t old_s2cr = 0;
+-        for (unsigned i = 0; i < nsmr; ++i) {
+-            uint32_t smr = guac_as_rd(as, 0x800ULL + 4ULL * i);
+-            uint32_t s2cr = guac_as_rd(as, 0xc00ULL + 4ULL * i);
+-            if (smr == 0 && (s2cr == 0 || s2cr == (2u << 16))) {
+-                idx = (int)i;
+-                old_s2cr = s2cr;
+-                break;
+-            }
+-        }
+-        if (idx < 0) { ret = ENOSPC; goto done; }
+-        /* The stream audit above marked CBs referenced by valid routes. */
+-        int cb = -1;
+-        uint32_t old_sctlr = 0, old_cbar = 0, old_cba2r = 0;
+-        uint64_t bankoff = 0;
+-        for (unsigned c = ns2cb; c < ncb; ++c) {
+-            if (occupied[c / 64u] & (1ULL << (c % 64u)))
+-                continue;
+-            uint64_t off = cbbase + (uint64_t)c * pagesz;
+-            uint32_t sctlr = guac_as_rd(as, off);
+-            uint32_t cbar = guac_as_rd(as, pagesz + 4ULL * c);
+-            uint32_t cba2r = guac_as_rd(as, pagesz + 0x800ULL + 4ULL * c);
+-            /* Never take an active context. Nonzero inactive configuration
+-             * is ALSO not proof of ownership; require separate explicit opt-in.
+-             */
+-            if (sctlr || (!allow_residual && (cbar || cba2r)))
+-                continue;
+-            cb = (int)c;
+-            bankoff = off;
+-            old_sctlr = sctlr;
+-            old_cbar = cbar;
+-            old_cba2r = cba2r;
+-            break;
+-        }
+-        if (cb < 0) { ret = EBUSY; goto done; }
+-
+-        const uint64_t smr_off = 0x800ULL + 4ULL * (unsigned)idx;
+-        const uint64_t s2cr_off = 0xc00ULL + 4ULL * (unsigned)idx;
+-        const uint64_t cbar_off = pagesz + 4ULL * (unsigned)cb;
+-        const uint64_t cba2r_off = pagesz + 0x800ULL + 4ULL * (unsigned)cb;
+-        const uint32_t new_smr = (1u << 31) |
+-                (GUAC_WLAN_SID_MASK << 16) | GUAC_WLAN_SID;
+-        /* CBAR.TYPE=S1/S2-bypass, BPSHCFG=NSH, MEMATTR=WB. */
+-        const uint32_t new_cbar = (1u << 16) | (3u << 8) | (15u << 12);
+-        const uint32_t new_cba2r = 1u; /* AArch64 */
+-        /* Qualcomm SCTLR control bits, leaving SCTLR.M=0. */
+-        const uint32_t new_sctlr = (3u << 22) | (1u << 12) |
+-                (1u << 7) | (1u << 6) | (1u << 5) |
+-                (1u << 2) | (1u << 1);
+-        const uint32_t new_s2cr = (3u << 8) | (unsigned)cb;
+-
+-        if (guac_as_rd(as, smr_off) != 0 ||
+-            guac_as_rd(as, s2cr_off) != old_s2cr ||
+-            guac_as_rd(as, bankoff) != old_sctlr ||
+-            guac_as_rd(as, cbar_off) != old_cbar ||
+-            guac_as_rd(as, cba2r_off) != old_cba2r) {
+-            ret = EBUSY;
+-            goto done;
+-        }
+-        /* Program a disabled S1 context before routing WLAN to it. */
+-        guac_as_wr(as, cba2r_off, new_cba2r);
+-        guac_as_wr(as, cbar_off, new_cbar);
+-        guac_as_wr(as, bankoff, new_sctlr);
+-        __asm__ volatile("dsb sy" ::: "memory");
+-        if (((guac_as_rd(as, cbar_off) >> 16) & 3u) != 1u ||
+-            !(guac_as_rd(as, cba2r_off) & 1u) ||
+-            (guac_as_rd(as, bankoff) & 1u) ||
+-            ((guac_as_rd(as, bankoff) >> 12) & 1u) != 1u) {
+-            ret = EIO;
+-            goto wlan_cb_rollback;
+-        }
+-        guac_as_wr(as, s2cr_off, new_s2cr);
+-        __asm__ volatile("dsb sy" ::: "memory");
+-        if (((guac_as_rd(as, s2cr_off) >> 16) & 3u) != 0 ||
+-            (guac_as_rd(as, s2cr_off) & 0xffu) != (unsigned)cb) {
+-            ret = EIO;
+-            goto wlan_cb_rollback;
+-        }
+-        guac_as_wr(as, smr_off, new_smr);
+-        __asm__ volatile("dsb sy" ::: "memory");
+-        if (guac_as_rd(as, smr_off) != new_smr ||
+-            ((guac_as_rd(as, s2cr_off) >> 16) & 3u) != 0 ||
+-            (guac_as_rd(as, s2cr_off) & 0xffu) != (unsigned)cb) {
+-            ret = EIO;
+-            goto wlan_cb_rollback;
+-        }
+-        guac_last_smmu_snapshot.free_smr = (uint32_t)idx;
+-        guac_last_smmu_snapshot.free_cb = (uint32_t)cb;
+-        /* EAGAIN means registers accepted but ownership remains unproven.
+-         * Do NOT set pm_wlan_verified or start copy-engine DMA.
+-         */
+-        ret = EAGAIN;
+-        goto wlan_cb_rollback;
+-
+-    wlan_cb_rollback:
+-        guac_as_wr(as, smr_off, 0);
+-        __asm__ volatile("dsb sy" ::: "memory");
+-        guac_as_wr(as, s2cr_off, old_s2cr);
+-        guac_as_wr(as, bankoff, 0);
+-        guac_as_wr(as, cbar_off, old_cbar);
+-        guac_as_wr(as, cba2r_off, old_cba2r);
+-        guac_as_wr(as, bankoff, old_sctlr);
+-        __asm__ volatile("dsb sy" ::: "memory");
+-        if (guac_as_rd(as, smr_off) != 0 ||
+-            guac_as_rd(as, s2cr_off) != old_s2cr ||
+-            guac_as_rd(as, cbar_off) != old_cbar ||
+-            guac_as_rd(as, cba2r_off) != old_cba2r ||
+-            guac_as_rd(as, bankoff) != old_sctlr)
+-            ret = EIO;
+-        goto done;
++        if (id0 & (1u << 8)) { ret = ENOTSUP; goto done; }
+@@ -870,2 +783,4 @@
+-    /* NUMS2CB context banks [0, ns2cb) are stage-2-only; never select
+-     * one for the stage-1-disabled, stage-2-bypass WLAN configuration. */
++    for (unsigned c = 0; c < ns2cb; ++c)
++        guac_last_smmu_snapshot.cb[c].flags |= GUAC_SMMU_FLAG_S2_ONLY;
++    /* NUMS2CB context banks [0, ns2cb) are stage-2-only. The inventory
++     * identifies possible candidates, not verified unowned banks. */
+@@ -877,0 +793 @@
++        guac_last_smmu_snapshot.cb[c].flags |= GUAC_SMMU_FLAG_UNREFERENCED;
+@@ -887 +803,5 @@
+-        if (sctlr == 0 && cbar == 0 && cba2r == 0) {
++        if (sctlr || cbar || cba2r)
++            guac_last_smmu_snapshot.cb[c].flags |= GUAC_SMMU_FLAG_RESIDUAL;
++        if (sctlr == 0 && cbar == 0 && cba2r == 0 && free_cb < 0) {
++            /* A reset-looking candidate is NOT a bank we own. Keep
++             * scanning so the snapshot captures other reservations. */
+@@ -889 +808,0 @@
+-            break;
+@@ -901,2 +820,4 @@
+-    if (diag_mode) {
+-        printf("GUAC SMMU-CB-AUDIT: ncb=%u stage2only=%u referenced=%u unreferenced=%u active=%u inactive-configured=%u clear=%d\n",
++    if (diag_mode || wlan_cbattach) {
++        printf("GUAC SMMU-HANDOFF: valid-trans=%u stale-trans=%u (reserved; no owner granted)\n",
++               valid_handoff_routes, stale_trans_routes);
++        printf("GUAC SMMU-CB-AUDIT: ncb=%u stage2only=%u referenced=%u unreferenced=%u active=%u inactive-configured=%u reset-looking=%d\n",
+@@ -938,4 +859,6 @@
+-    /* Do not claim ownership of a bank just because it looks reset.
+-     * An SMMUv2 context bank may be reserved by firmware or another DMA
+-     * client without being listed in the non-secure stream table.
+-     * Until a firmware-handoff-aware domain driver exists, fail closed.
++    /* 0165 records firmware handoff reservations, not a proof of ownership.
++     * Even the Qualcomm Android allocator runs as the SMMU owner and is
++     * synchronized with its attached devices; this late XNU ioctl is not.
++     * A bank not referenced in visible SMRs may be owned by secure world.
++     * A future driver needs an explicit ownership/partition contract before
++     * writing SMR/S2CR/CB or granting DMA. Always fail closed here.
