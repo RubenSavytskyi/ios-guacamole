@@ -1,0 +1,12 @@
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -682,7 +682,8 @@
+         uint64_t s2cr_off = 0xc00ULL + 4ULL * (unsigned)index;
+         uint32_t new_smr = (1u << 31) |
+                 (GUAC_WLAN_SID_MASK << 16) | GUAC_WLAN_SID;
+-        uint32_t bypass_s2cr = 1u << 16; /* S2CR_TYPE_BYPASS */
++        uint32_t bypass_s2cr = (1u << 16) | (3u << 8);
++        /* S2CR_TYPE_BYPASS | S2CR_SHCFG_NSH */
+ 
+         /* Recheck immediately before modifying this previously invalid slot. */
+         if (guac_as_rd(as, smr_off) != 0 ||
