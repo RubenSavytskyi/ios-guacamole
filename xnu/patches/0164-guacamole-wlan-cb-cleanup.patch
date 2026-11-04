@@ -1,0 +1,19 @@
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -741,6 +741,7 @@
+         PE_parse_boot_argn("sweetwlanresidualcb", &allow_residual,
+                 sizeof(allow_residual));
+         if (diag_mode) { ret = EAGAIN; goto done; }
++        if (allow_residual) { ret = EPERM; goto done; }
+         if (new_bypass) { ret = EINVAL; goto done; }
+         /* Current audit/write scheme cannot handle EXIDS. */
+         if ((id0 & (1u << 8)) || !(id0 & (1u << 30))) {
+@@ -841,7 +842,7 @@
+          * Do NOT set pm_wlan_verified or start copy-engine DMA.
+          */
+         ret = EAGAIN;
+-        goto done;
++        goto wlan_cb_rollback;
+ 
+     wlan_cb_rollback:
+         guac_as_wr(as, smr_off, 0);
