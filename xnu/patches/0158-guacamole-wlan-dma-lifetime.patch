@@ -1,0 +1,122 @@
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -84,9 +84,24 @@
+ #define PMEM_WLAN_TOTAL_MAX (128ULL * 1024ULL * 1024ULL)
+ #define PMEM_WLAN_ALLOC32 _IOWR('P', 9, struct pmem_alloc)
+ #define PMEM_WLAN_FREE _IOW('P', 10, uint64_t)
++
++/*
++ * WLAN DMA ABI v1.
++ * These ioctls never authorize an SMMU domain by themselves.
++ */
++struct guac_wlan_dma_request {
++    uint32_t version;
++    uint32_t flags;
++    uint64_t pa;
++    uint64_t size;
++    uint64_t dma_addr;
++};
++
++#define PMEM_WLAN_DMA_MAP _IOWR('P', 11, struct guac_wlan_dma_request)
++#define PMEM_WLAN_DMA_UNMAP _IOW('P', 12, uint64_t)
+ static struct {
+     vm_offset_t va;
+-    uint64_t pa, size;
++    uint64_t pa, size, dma_addr;
+ } pm_wlan_allocs[PMEM_WLAN_MAX_ALLOCS];
+ static uint64_t pm_wlan_allocated;
+ static int pm_wlan_verified;
+@@ -358,6 +373,9 @@
+ {
+     for (int i = 0; i < PMEM_WLAN_MAX_ALLOCS; i++) {
+         if (pm_wlan_allocs[i].va && pm_wlan_allocs[i].pa == pa) {
++            /* Never release backing pages while device DMA is mapped. */
++            if (pm_wlan_allocs[i].dma_addr)
++                return EBUSY;
+             kmem_free(kernel_map, pm_wlan_allocs[i].va,
+                       (vm_size_t)pm_wlan_allocs[i].size);
+             pm_wlan_allocated -= pm_wlan_allocs[i].size;
+@@ -365,6 +383,69 @@
+             return 0;
+         }
+     }
++    return ENOENT;
++}
++
++
++/*
++ * WLAN translated-DMA interface.
++ *
++ * Ownership and lifetime checks are implemented here.
++ * No translated IOMMU domain is authorized yet.
++ *
++ * A later domain driver must install/verify the translation and
++ * perform required TLB maintenance before setting dma_addr.
++ */
++static int
++pm_do_wlan_dma_map(struct guac_wlan_dma_request *r)
++{
++    if (r->version != 1 || r->flags != 0 ||
++        r->dma_addr != 0 || !r->pa || !r->size)
++        return EINVAL;
++
++    if (r->pa >= 0x100000000ULL ||
++        r->size > 0x100000000ULL - r->pa)
++        return ERANGE;
++
++    for (int i = 0; i < PMEM_WLAN_MAX_ALLOCS; ++i) {
++        if (!pm_wlan_allocs[i].va ||
++            pm_wlan_allocs[i].pa != r->pa)
++            continue;
++
++        if (r->size > pm_wlan_allocs[i].size)
++            return EINVAL;
++
++        if (pm_wlan_allocs[i].dma_addr)
++            return EALREADY;
++
++        /*
++         * An owned allocation is not an installed IOVA mapping.
++         * No domain ownership or page-table backend exists yet.
++         */
++        return ENOTSUP;
++    }
++
++    return ENOENT;
++}
++
++static int
++pm_do_wlan_dma_unmap(uint64_t dma_addr)
++{
++    if (dma_addr < 0xa0000000ULL ||
++        dma_addr >= 0xb0000000ULL)
++        return EINVAL;
++
++    for (int i = 0; i < PMEM_WLAN_MAX_ALLOCS; ++i) {
++        if (pm_wlan_allocs[i].va &&
++            pm_wlan_allocs[i].dma_addr == dma_addr) {
++            /*
++             * Never clear ownership without successfully
++             * removing the device translation first.
++             */
++            return ENOTSUP;
++        }
++    }
++
+     return ENOENT;
+ }
+ 
+@@ -913,6 +994,13 @@
+     case PMEM_WLAN_FREE:
+         err = pm_do_wlan_free(*(uint64_t *)data);
+         break;
++    case PMEM_WLAN_DMA_MAP:
++        err = pm_do_wlan_dma_map(
++            (struct guac_wlan_dma_request *)data);
++        break;
++    case PMEM_WLAN_DMA_UNMAP:
++        err = pm_do_wlan_dma_unmap(*(uint64_t *)data);
++        break;
+ 	case _IO('P', 7):
+ 		err = guac_wlan_attach();
+ 		break;
