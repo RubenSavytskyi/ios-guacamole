@@ -1,0 +1,117 @@
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -484,10 +484,17 @@
+ guac_as_rd(volatile uint8_t *p, uint64_t off)
+ {
+     return *(volatile uint32_t *)(p + off);
+ }
+ 
++/* 0159: gated SMMU register writer; never call on an owned CB. */
++static inline void
++guac_as_wr(volatile uint8_t *p, uint64_t off, uint32_t val)
++{
++    *(volatile uint32_t *)(p + off) = val;
++}
++
+ /* 0154: A bounded snapshot of reads the 0153 audit already performs.
+  * This buffer is NOT a mapping and never authorizes CE DMA. Holding the
+  * existing sweet_pmem mutex serializes producer and consumer ioctls.
+  */
+ #define GUAC_SMMU_SNAP_VERSION 1u
+@@ -623,10 +630,96 @@
+     if (free_smr < 0) {
+         printf("GUAC SMMU-DIAG: no unoccupied SMR (ENOSPC)\n");
+         ret = ENOSPC;
+         goto done;
+     }
++    /* 0159: opt-in direct S2CR bypass for WLAN's 0x640/0x1 stream group.
++     *
++     * Unlike Qualcomm's S1-disabled TRANSLATION context, the ARM SMMUv2
++     * S2CR_TYPE_BYPASS route has NO context-bank allocation. The Linux ARM SMMU
++     * driver also supports such identity domains, but firmware/EL2 may reject
++     * them on this SoC. Never touch an existing SMR or any CB. Do not take
++     * this path in diagnostic mode.
++     *
++     * Enable only with sweetwlannewbypass=1, after the existing full
++     * stream-overlap audit. CE DMA still requires sweetwlandma=1 separately.
++     */
++    int new_bypass = 0;
++    PE_parse_boot_argn("sweetwlannewbypass", &new_bypass,
++            sizeof(new_bypass));
++    if (new_bypass && !diag_mode) {
++        int index = -1;
++        uint32_t old_s2cr = 0;
++        /* Find only a reset/unused stream entry. An INVALID SMR with
++         * residual fields is conservatively treated as reserved.
++         */
++        for (unsigned i = 0; i < nsmr; ++i) {
++            uint32_t smr = guac_as_rd(as, 0x800ULL + 4ULL * i);
++            uint32_t s2cr = guac_as_rd(as, 0xc00ULL + 4ULL * i);
++            if (smr != 0)
++                continue;
++            /* Allow only reset-like S2CR: zero or FAULT/type=2, CB=0. */
++            if (s2cr != 0 && s2cr != (2u << 16))
++                continue;
++            index = (int)i;
++            old_s2cr = s2cr;
++            break;
++        }
++        if (index < 0) {
++            ret = ENOSPC;
++            goto done;
++        }
++
++        uint64_t smr_off = 0x800ULL + 4ULL * (unsigned)index;
++        uint64_t s2cr_off = 0xc00ULL + 4ULL * (unsigned)index;
++        uint32_t new_smr = (1u << 31) |
++                (GUAC_WLAN_SID_MASK << 16) | GUAC_WLAN_SID;
++        uint32_t bypass_s2cr = 1u << 16; /* S2CR_TYPE_BYPASS */
++
++        /* Recheck immediately before modifying this previously invalid slot. */
++        if (guac_as_rd(as, smr_off) != 0 ||
++            guac_as_rd(as, s2cr_off) != old_s2cr) {
++            ret = EBUSY;
++            goto done;
++        }
++
++        /* Program routing action BEFORE making stream match valid. */
++        guac_as_wr(as, s2cr_off, bypass_s2cr);
++        __asm__ volatile("dsb sy" ::: "memory");
++        if (guac_as_rd(as, s2cr_off) != bypass_s2cr) {
++            ret = EIO;
++            goto new_bypass_rollback;
++        }
++        guac_as_wr(as, smr_off, new_smr);
++        __asm__ volatile("dsb sy" ::: "memory");
++        if (guac_as_rd(as, smr_off) != new_smr ||
++            guac_as_rd(as, s2cr_off) != bypass_s2cr) {
++            ret = EIO;
++            goto new_bypass_rollback;
++        }
++
++        /* The SMR walk above already rejected all overlapping routes.
++         * Verify both registers, then grant the same identity-DMA mode
++         * used for firmware-installed direct bypass in patch 0156.
++         */
++        guac_last_smmu_snapshot.free_smr = (uint32_t)index;
++        pm_wlan_verified = 1;
++        ret = 0;
++        goto done;
++
++    new_bypass_rollback:
++        /* Disable the newly created match BEFORE restoring its action. */
++        guac_as_wr(as, smr_off, 0);
++        __asm__ volatile("dsb sy" ::: "memory");
++        guac_as_wr(as, s2cr_off, old_s2cr);
++        __asm__ volatile("dsb sy" ::: "memory");
++        if (guac_as_rd(as, smr_off) != 0 ||
++            guac_as_rd(as, s2cr_off) != old_s2cr)
++            ret = EIO;
++        goto done;
++    }
++
+     int free_cb = -1;
+     unsigned matched_cb = 0, unreferenced_cb = 0, active_cb = 0;
+     unsigned inactive_residual_cb = 0;
+     int sample_cb = -1;
+     uint32_t sample_sctlr = 0, sample_cbar = 0, sample_cba2r = 0;
