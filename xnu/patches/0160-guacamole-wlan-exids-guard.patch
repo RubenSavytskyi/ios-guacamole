@@ -1,0 +1,18 @@
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -647,6 +647,15 @@
+     PE_parse_boot_argn("sweetwlannewbypass", &new_bypass,
+             sizeof(new_bypass));
+     if (new_bypass && !diag_mode) {
++        /*
++         * EXIDS changes stream-valid handling.
++         * The current SMR audit/writer only supports legacy format.
++         */
++        if (id0 & (1u << 8)) {
++            ret = ENOTSUP;
++            goto done;
++        }
++
+         int index = -1;
+         uint32_t old_s2cr = 0;
+         /* Find only a reset/unused stream entry. An INVALID SMR with
