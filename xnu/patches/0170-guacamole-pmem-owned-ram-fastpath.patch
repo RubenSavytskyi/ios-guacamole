@@ -1,0 +1,44 @@
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -145,10 +145,41 @@
+ {
+ 	int err = 0;
+ 	lck_mtx_lock(&sweet_pmem_lock);
+ 	while (!err && uio_resid(uio) > 0) {
+ 		uint64_t pa = (uint64_t)uio_offset(uio);
++		/*
++		 * PMEM_ALLOC returns physically contiguous, kernel-owned RAM.
++		 * Its original kernel VA is retained in pm_alloc[].  Transfer
++		 * these buffers directly instead of falling back to individual
++		 * device-register accesses when pmap_valid_address() rejects an
++		 * address (e.g. after sharing RMTFS memory with the modem).
++		 *
++		 * Only registered PMEM_ALLOC ranges are eligible; all unrelated
++		 * physical addresses keep the existing RAM/device access logic.
++		 * Cache maintenance is preserved on both sides of uiomove.
++		 */
++		bool handled_alloc = false;
++		for (unsigned i = 0; i < PMEM_LIST_MAX; i++) {
++			if (!pm_alloc[i].va || pa < pm_alloc[i].pa)
++				continue;
++			uint64_t delta = pa - pm_alloc[i].pa;
++			if (delta >= pm_alloc[i].size)
++				continue;
++			uint64_t remain = pm_alloc[i].size - delta;
++			/* At most one 2 MiB window per uiomove. */
++			unsigned n = (unsigned)MIN((uint64_t)uio_resid(uio),
++			    MIN(remain, PMEM_WIN));
++			caddr_t va = (caddr_t)(pm_alloc[i].va + (vm_offset_t)delta);
++			flush_dcache64((addr64_t)pa, n, TRUE);
++			err = uiomove(va, (int)n, uio);
++			flush_dcache64((addr64_t)pa, n, TRUE);
++			handled_alloc = true;
++			break;
++		}
++		if (handled_alloc)
++			continue;
+ 		uint64_t off = pa & PAGE_MASK;
+ 		unsigned n = (unsigned)MIN((user_ssize_t)(PAGE_SIZE - off), uio_resid(uio));
+ 		if (pmap_valid_address(pa)) {
+ 			caddr_t va = (caddr_t)phystokv(pa);
+ 			flush_dcache64((addr64_t)pa, n, TRUE);
