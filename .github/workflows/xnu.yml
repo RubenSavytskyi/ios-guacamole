@@ -83,6 +83,7 @@ jobs:
           grep -Fq 'GUAC_SMMU_S2CR_EXIDVALID' dxb/xnu/bsd/dev/sweet_pmem.c
           grep -Fq 'guac_wlan_qcom_cbattach' dxb/xnu/bsd/dev/sweet_pmem.c
           grep -Fq '0168: choose only eligible firmware bypass or blank contexts' dxb/xnu/bsd/dev/sweet_pmem.c
+          grep -Fq 'PMEM_WLAN_ALLOC35' dxb/xnu/bsd/dev/sweet_pmem.c
           grep -Fq 'sweetwlanreusecb' dxb/xnu/bsd/dev/sweet_pmem.c
           ! grep -Fq 'wlan_cb_rollback:' dxb/xnu/bsd/dev/sweet_pmem.c
           grep -Fq 'bsd/dev/sweet_pmem.c' dxb/xnu/bsd/conf/files

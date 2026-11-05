@@ -1,0 +1,70 @@
+diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -323,16 +323,30 @@
+  * /dev/pmem already performs cache maintenance on CPU reads/writes.
+  * This is NOT an IOVA/page-table allocator: only read-only verified
+  * firmware-provided stage-1-bypass configuration may authorize it.
+  */
+-static int
+-pm_do_wlan_alloc(struct pmem_alloc *a)
++/*
++ * 0169: The existing 32-bit ABI remains the default. WCN3990's SNOC CE
++ * supports 35-bit DMA addresses, but the userspace CE/WMI implementation
++ * must explicitly opt in to the separate 35-bit ioctl. Never return a
++ * high physical address through PMEM_WLAN_ALLOC32.
++ */
++#define PMEM_WLAN_ALLOC35 _IOWR('P', 13, struct pmem_alloc)
++static int
++pm_do_wlan_alloc(struct pmem_alloc *a, bool dma35)
+ {
+     int permitted = 0;
+     PE_parse_boot_argn("sweetwlandma", &permitted, sizeof(permitted));
+     if (!permitted || !pm_wlan_verified) return EPERM;
++    if (dma35) {
++        int wide_permitted = 0;
++        PE_parse_boot_argn("sweetwlandma35", &wide_permitted,
++                sizeof(wide_permitted));
++        if (!wide_permitted) return EPERM;
++    }
++    const uint64_t pa_limit = dma35 ? (1ULL << 35) : (1ULL << 32);
+     if (a->size == 0 || a->size > 16ULL * 1024ULL * 1024ULL ||
+-        a->size > (0x100000000ULL - PAGE_MASK)) return EINVAL;
++        a->size > (pa_limit - PAGE_MASK)) return EINVAL;
+     vm_size_t size = round_page(a->size);
+     uint64_t align = a->align > PAGE_SIZE ? a->align : PAGE_SIZE;
+     if (!size || align > 0x1000000ULL || (align & (align - 1)) ||
+         size > PMEM_WLAN_TOTAL_MAX - pm_wlan_allocated) return EINVAL;
+@@ -341,9 +355,9 @@
+         if (!pm_wlan_allocs[i].va) { slot = i; break; }
+     }
+     if (slot < 0) return ENOSPC;
+     vm_offset_t va = 0;
+-    ppnum_t max_pnum = (ppnum_t)(atop_64(0x100000000ULL) - 1);
++    ppnum_t max_pnum = (ppnum_t)(atop_64(pa_limit) - 1);
+     if (kmem_alloc_contig(kernel_map, &va, size, PAGE_MASK,
+             max_pnum, (ppnum_t)(atop_64(align) - 1),
+             KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS)
+         return ENOMEM;
+@@ -352,10 +366,10 @@
+         kmem_free(kernel_map, va, size);
+         return ENOMEM;
+     }
+     uint64_t pa = ptoa_64(pn);
+-    if (!pa || pa >= 0x100000000ULL ||
+-        (uint64_t)size > 0x100000000ULL - pa) {
++    if (!pa || pa >= pa_limit ||
++        (uint64_t)size > pa_limit - pa) {
+         kmem_free(kernel_map, va, size);
+         return ERANGE;
+     }
+     flush_dcache64((addr64_t)pa, (unsigned)size, TRUE);
+@@ -1277,4 +1291,7 @@
+     case PMEM_WLAN_ALLOC32:
+-        err = pm_do_wlan_alloc((struct pmem_alloc *)data);
++        err = pm_do_wlan_alloc((struct pmem_alloc *)data, false);
++        break;
++    case PMEM_WLAN_ALLOC35:
++        err = pm_do_wlan_alloc((struct pmem_alloc *)data, true);
+         break;
+     case PMEM_WLAN_FREE:
