@@ -73,6 +73,33 @@ void con_str(const char *label, const char *s)
 	row++;
 }
 
+/* Long free-form lines: wrap at the right edge instead of clipping. */
+void con_text(const char *s)
+{
+	const int maxcol = FB_W / CH_W;
+	const int maxrow = FB_H / CH_H;
+	int col = 0;
+
+	while (*s) {
+		char ch = *s++;
+		if (ch == '\r') {
+			continue;
+		}
+		if (ch == '\n' || col >= maxcol) {
+			row++;
+			col = 0;
+			if (ch == '\n') {
+				continue;
+			}
+		}
+		if (row >= maxrow - 1) {
+			return;
+		}
+		put_char(col++, ch, WHITE);
+	}
+	row++;
+}
+
 void con_hex(const char *label, uint64_t v)
 {
 	char buf[17];

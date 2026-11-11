@@ -1,3 +1,39 @@
+# Active handoff — iOS boots to the lock screen; only touch is left (2026-11-12 00:45, opencode)
+
+- State: the iOS 16.7.16 root (12 GiB HFS+, sparse `../guac-artifacts/ios16-root.simg`, sha256 `884f154b…`)
+  is flashed to `userdata` (`/dev/block/sda19`) and boots to the lock screen on the phone (GM1911,
+  serial 0ea51515, bootloader unlocked, slot b). Nothing but userdata was flashed; every test uses
+  `fastboot boot`.
+- Useful boot images (all `sweetusb=0`, the only value known to boot):
+  - `shim/out/ios16-boot-clean.img` — clean UI (`sweetfb_noconsole=1`), touch driver off.
+  - `shim/out/ios16-boot-touch10.img` — console visible, `sweettouchdelay=10`; boots fine, touch dead.
+  - `shim/out/ios16-boot-touchkern.img` — clean UI + the patched kernel described below (touch fix).
+  - `shim/out/logdump.img` — shim only (no XNU payload): decodes the SWEETLOG ring at the end of
+    `userdata` and prints the last `SWEET TOUCH`/`SWEET RPMH` lines of the previous boot on screen.
+- Touch root cause (from that ring): `sweet_touch.c` stops in `touch_se_init()`:
+  `SWEET TOUCH: se fw=0x303 proto=3 status=0 tx=0x20102964 rx=0x20104900 ios=0`, then
+  `need ABL-loaded I2C firmware and 32-bit FIFOs; probes skipped`. Every gate term passes except
+  `touch_rd(st.se, 0x64) & 1`: `0x64` is `GENI_IF_DISABLE_RO` and bit 0 is `FIFO_IF_DISABLE` — ABL left
+  the SE configured for DMA/GSI. Mainline `geni_configure_xfer_mode()` clears `FIFO_IF_DISABLE`
+  (bit 0 of `SE_FIFO_IF_DISABLE`, `0x2008`) when switching to FIFO mode; our driver never does.
+- Shim workaround: dead end, do not retry. Poking `0xc80000` from the shim resets the SoC (900E
+  crash-dump, or straight back to fastboot). Voting `gcc 0x52014 |= 0x1f` and reading `0x68` work, but
+  the first access to `0x64`/`0x2008` still kills the machine, including after enabling the RCG root
+  (`0x1e148 |= 1`). `shim/shim.c` therefore has no SE access any more.
+- Fix applied in the kernel binary instead (`tools/patch-touch-kernel.py`): inside `_touch_thread`
+  (where `touch_se_init` is inlined) two instructions change —
+  `0xfffffe00074fb5e0 ldr w8,[x8,#0x64]` -> `str wzr,[x8,#0x2008]` and
+  `0xfffffe00074fb5f0 tbnz w8,#0,<fail>` -> `nop`. `w8` is overwritten by
+  `and w8, w21, #0x3f000000` immediately after, and none of the driver's own register writes are lost
+  (0xe18/0xe1c/0x644/0x618/0x648/0x258/… still execute). Result:
+  `xnu/out-53/kernel.development.sweet-touchfix`; rebuild the image with
+  `CPUS=8 TOUCH=1 KEYS=1 USB=0 tools/guac-mkboot.sh <patched kernel> <stock boot_b.img> shim/out/Image out.img "<clean args>"`.
+  To revert, copy `kernel.development.sweet` back over the `-touchfix` name.
+- Device recovery after a reset: hold Power ~15-20 s, then Power+Volume Down for fastboot.
+- Push/CI: WSL git has no credentials. Windows git has `RubenSavytskyi` in Credential Manager, but that
+  account has no write access to `coreycusick/ios-guacamole` (403) and has no fork. Kernel changes
+  therefore need either someone with push access or local binary patches like the one above.
+
 # Active handoff — clean install of iOS 16 root on a second OnePlus 7 Pro (2026-11-11 22:30, opencode)
 
 - Goal: reproduce the iOS 16.7.16 root on another guacamole (GM1911, serial 0ea51515, slot b, Android 16

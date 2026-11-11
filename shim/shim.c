@@ -377,6 +377,15 @@ static uint32_t to_us(uint64_t ticks)
 	return ticks * 10 / 192;	/* 19.2 MHz */
 }
 
+static int str_same(const char *a, const char *b)
+{
+	while (*a && *a == *b) {
+		a++;
+		b++;
+	}
+	return *a == *b;
+}
+
 void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
@@ -390,6 +399,19 @@ void shim_main(uint64_t dtb)
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();
+
+#if defined(BOARD_GUACAMOLE)
+	/* Log-only image: no XNU payload, so decode the SWEETLOG ring that the
+	 * previous boot left at the end of userdata and keep it on screen. */
+	if (str_same(why, "no SWEETXNU payload")) {
+		con_clear(BLACK);
+		sweet_log_dump();
+		con_skip();
+		con_str("LOG", "reset in ~10 min");
+		delay_ms(600000);
+		reset(20);
+	}
+#endif
 
 	/* No payload: probe the internal UFS while the MMU is still off. */
 	stage = "ufs";

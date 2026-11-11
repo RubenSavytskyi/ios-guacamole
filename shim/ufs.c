@@ -264,3 +264,234 @@ void test_ufs(void)
 		return;
 	list_partitions(elba, nent);
 }
+
+/*
+ * SWEETLOG reader (kernel patch 0047): the kernel keeps a 4 MiB console ring
+ * and writes it to the LAST 4 MiB + 4 KiB of userdata, block 0 being
+ *   "SWEETLOG" | u32 version | u32 size | u64 total | u64 seq.
+ * Read-only. The dump below runs before XNU, so it shows the PREVIOUS boot.
+ */
+#define SWEETLOG_RING_MAX	(4u << 20)
+#define SWEETLOG_BLOCKS		(1u + SWEETLOG_RING_MAX / BLOCK)
+#define SWEETLOG_HITS		24
+#define SWEETLOG_LINE		112
+
+static uint32_t le32(const uint8_t *p)
+{
+	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static int has_word(const char *s, const char *w)
+{
+	for (; *s; s++) {
+		const char *a = s, *b = w;
+		while (*a && *b && *a == *b) {
+			a++;
+			b++;
+		}
+		if (!*b)
+			return 1;
+	}
+	return 0;
+}
+
+struct log_hits {
+	char line[SWEETLOG_HITS][SWEETLOG_LINE];
+	unsigned n, pos;
+};
+
+static void log_hit(struct log_hits *h, const char *line, unsigned len)
+{
+	char *d = h->line[h->pos];
+	unsigned k = len < SWEETLOG_LINE - 1 ? len : SWEETLOG_LINE - 1;
+	for (unsigned i = 0; i < k; i++)
+		d[i] = line[i];
+	d[k] = 0;
+	h->pos = (h->pos + 1) % SWEETLOG_HITS;
+	if (h->n < SWEETLOG_HITS)
+		h->n++;
+}
+
+/* Find a GPT partition by ASCII name; LBAs are the device's 4 KiB units. */
+static int find_partition(const char *want, uint32_t *first, uint32_t *last)
+{
+	static uint8_t hdr[BLOCK] __attribute__((aligned(4096)));
+	static uint8_t ents[128 * 128] __attribute__((aligned(4096)));
+
+	if (read_blocks(1, 1, hdr) || __builtin_memcmp(hdr, "EFI PART", 8))
+		return 0;
+	uint32_t nent = le32(hdr + 80), esz = le32(hdr + 84), elba = le32(hdr + 72);
+	if (esz != 128 || nent == 0 || nent > 128)
+		return 0;
+	if (read_blocks(elba, (nent * 128u + BLOCK - 1) / BLOCK, ents))
+		return 0;
+	for (uint32_t i = 0; i < nent; i++) {
+		const uint8_t *e = ents + i * 128;
+		const char *w = want;
+		uint32_t f = (uint32_t)le64(e + 32), l = (uint32_t)le64(e + 40);
+		int ok = f != 0;
+		unsigned c = 0;
+		for (; ok && w[c]; c++) {
+			if (e[56 + 2 * c] != (uint8_t)w[c] || e[57 + 2 * c])
+				ok = 0;
+		}
+		if (ok && (e[56 + 2 * c] || e[57 + 2 * c]))
+			ok = 0;
+		if (ok) {
+			*first = f;
+			*last = l;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+struct log_state {
+	struct log_hits hits;
+	char tail[3][SWEETLOG_LINE];
+	unsigned ntail, tpos;
+	char cur[SWEETLOG_LINE];
+	unsigned curlen;
+};
+
+static struct log_state st_log;	/* zero in .bss */
+
+static void log_line(struct log_state *p)
+{
+	if (!p->curlen)
+		return;
+	if (has_word(p->cur, "SWEET TOUCH") || has_word(p->cur, "SWEET RPMH")) {
+		log_hit(&p->hits, p->cur, p->curlen);
+	} else {
+		char *d = p->tail[p->tpos];
+		unsigned n = p->curlen < SWEETLOG_LINE - 1 ? p->curlen : SWEETLOG_LINE - 1;
+		for (unsigned i = 0; i < n; i++)
+			d[i] = p->cur[i];
+		d[n] = 0;
+		p->tpos = (p->tpos + 1) % 3;
+		if (p->ntail < 3)
+			p->ntail++;
+	}
+	p->curlen = 0;
+}
+
+static void log_feed(struct log_state *p, const uint8_t *b, unsigned n)
+{
+	for (unsigned i = 0; i < n; i++) {
+		char c = (char)b[i];
+		if (c == '\r')
+			continue;
+		if (c == '\n') {
+			log_line(p);
+			continue;
+		}
+		if (p->curlen < sizeof(p->cur))
+			p->cur[p->curlen++] = c;
+	}
+}
+
+/* Stream ring bytes [from, to); the ring itself is contiguous at base+1. */
+static int log_read(uint32_t ring_lba, uint64_t from, uint64_t to)
+{
+	static uint8_t buf[BLOCK] __attribute__((aligned(4096)));
+
+	while (from < to) {
+		uint32_t blk = (uint32_t)(from / BLOCK), off = (uint32_t)(from % BLOCK);
+		uint32_t n = BLOCK - off;
+		if (n > to - from)
+			n = (uint32_t)(to - from);
+		if (read_blocks(ring_lba + blk, 1, buf))
+			return 0;
+		log_feed(&st_log, buf + off, n);
+		from += n;
+	}
+	return 1;
+}
+
+void
+sweet_log_dump(void)
+{
+	static uint8_t hdr[BLOCK] __attribute__((aligned(4096)));
+	uint32_t first = 0, last = 0;
+	uint64_t total, seq, oldest, valid;
+	uint32_t size;
+
+	con_str("LOG", "sweetlog dump (read-only, previous boot)");
+	uint32_t hcs = ufs_rd(REG_HCS), hce = ufs_rd(REG_HCE);
+	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY)) {
+		con_str("LOG", "UFS host not ready: stop");
+		return;
+	}
+	if (ufs_rd(REG_UTRLDBR)) {
+		con_str("LOG", "UFS requests outstanding: stop");
+		return;
+	}
+	ufs_wr(REG_UTRLRSR, 0);
+	uintptr_t list = (uintptr_t)utrl;
+	ufs_wr(REG_UTRLBA, (uint32_t)list);
+	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
+	ufs_wr(REG_UTRLRSR, 1);
+	if (ufs_rd(REG_UTRLBA) != (uint32_t)list || ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
+	    !(ufs_rd(REG_UTRLRSR) & 1)) {
+		con_str("LOG", "UFS list base not taken: stop");
+		return;
+	}
+
+	uint32_t ocs = 0, st = 0;
+	static const uint8_t tur[6] = { 0x00 };
+	for (int i = 0; i < 3; i++) {
+		if (!scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st))
+			break;
+	}
+
+	if (!find_partition("userdata", &first, &last)) {
+		con_str("LOG", "userdata partition not found");
+		return;
+	}
+	con_hex2("LOG", "userdata lba=", first, "last=", last);
+	if (last + 1 < SWEETLOG_BLOCKS) {
+		con_str("LOG", "partition too small");
+		return;
+	}
+	uint32_t base = last + 1 - SWEETLOG_BLOCKS;
+
+	if (read_blocks(base, 1, hdr) || __builtin_memcmp(hdr, "SWEETLOG", 8)) {
+		con_str("LOG", "no SWEETLOG header at the partition end");
+		return;
+	}
+	size = le32(hdr + 12);
+	total = le64(hdr + 16);
+	seq = le64(hdr + 24);
+	if (size == 0 || size > SWEETLOG_RING_MAX || (size & (BLOCK - 1)) || total == 0) {
+		con_str("LOG", "implausible header");
+		return;
+	}
+	con_hex2("LOG", "total bytes=", (uint32_t)total, "flush seq=", (uint32_t)seq);
+
+	oldest = total > size ? total % size : 0;
+	valid = total < size ? total : size;
+	if (!log_read(base + 1, oldest, oldest + valid < size ? oldest + valid : size)) {
+		con_str("LOG", "read error");
+		return;
+	}
+	if (oldest + valid > size &&
+	    !log_read(base + 1, 0, oldest + valid - size)) {
+		con_str("LOG", "read error");
+		return;
+	}
+	log_line(&st_log);	/* final unterminated line */
+
+	con_str("LOG", "last SWEET TOUCH / RPMH lines:");
+	for (unsigned i = 0; i < st_log.hits.n; i++) {
+		unsigned idx = (st_log.hits.pos + SWEETLOG_HITS - st_log.hits.n + i) % SWEETLOG_HITS;
+		con_skip();
+		con_text(st_log.hits.line[idx]);
+	}
+	con_skip();
+	con_str("TAIL", "last console lines of that boot:");
+	for (unsigned i = 0; i < st_log.ntail; i++) {
+		unsigned idx = (st_log.tpos + 3 - st_log.ntail + i) % 3;
+		con_skip();
+		con_text(st_log.tail[idx]);
+	}
+}
