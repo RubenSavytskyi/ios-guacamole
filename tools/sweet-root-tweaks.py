@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Apply the SWEET bring-up changes to an iOS root made by tools/mkiosroot.sh.
 
-  sudo sweet-root-tweaks.py MOUNTED_ROOT
+  sudo sweet-root-tweaks.py MOUNTED_ROOT [--no-bbd] [--net]
   sweet-root-tweaks.py --launchd-plist IN OUT [--net]
   sweet-root-tweaks.py --job-env LABEL KEY VALUE IN OUT   (empty VALUE removes KEY)
 
@@ -162,12 +162,18 @@ def launchd_plist(src, dst):
     if '--net' in sys.argv:
         for k, j in NET_JOBS.items():
             jobs[k] = dict(j)
+    bbd = BBD_WRAPPER
+    if '--no-bbd' in sys.argv:
+        # A root built from the IPSW has no userland yet: /usr/libexec/sweet-bbd and
+        # libsweet-bbd.dylib are installed later through SWEETBOX. Until then the job must
+        # point at the real binary, or launchd cannot start the window server at all.
+        bbd = '/usr/libexec/backboardd'
     for job in jobs.values():
         if job.get('Label') == 'com.apple.backboardd':
-            job['ProgramArguments'] = [BBD_WRAPPER]
+            job['ProgramArguments'] = [bbd]
     save(dst, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
     print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} jobs removed ({", ".join(REMOVED_JOBS)}), '
-          f'{AUTORUN_JOB["Label"]} added, backboardd via {BBD_WRAPPER}')
+          f'{AUTORUN_JOB["Label"]} added, backboardd via {bbd}')
 
 
 def containers(root):
@@ -278,7 +284,7 @@ def main():
     if len(sys.argv) in (4, 5) and sys.argv[1] == '--launchd-plist':
         launchd_plist(sys.argv[2], sys.argv[3])
         return
-    if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
+    if len(sys.argv) < 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
         sys.exit(__doc__)
     root = sys.argv[1]
     launchd(root)

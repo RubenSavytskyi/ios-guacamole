@@ -1,4 +1,4 @@
-# Active handoff — clean install of iOS 16 root on a second OnePlus 7 Pro (2026-11-11 20:55, opencode)
+# Active handoff — clean install of iOS 16 root on a second OnePlus 7 Pro (2026-11-11 22:30, opencode)
 
 - Goal: reproduce the iOS 16.7.16 root on another guacamole (GM1911, serial 0ea51515, slot b, Android 16
   LineageOS 23.2 on OOS 12 vendor). Nothing flashed yet; `userdata` untouched (227 GB f2fs, LineageOS live).
@@ -12,17 +12,42 @@
   - tools/mkiosroot.sh: the APFS side now has two backends (apfs-fuse when present, else fsapfsmount +
     dmg2img for the UDIF OS image) and `vol_root()` finds the volume directory instead of hardcoding
     `os/root`. apfs-fuse path unchanged in behaviour, not yet run end to end.
-  - IPSW `iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw` in `../guac-artifacts/` (outside git):
-    ~5.5 GB of 6.17 GB, with the `.aria2` control file, so **`aria2c -c` resumes**; the 3 DMGs needed are
-    OS `087-86698-044.dmg`, Cryptex1,SystemOS `087-86593-047.dmg`, Cryptex1,AppOS `087-86715-047.dmg`.
+  - IPSW: the user downloaded the complete `iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw`
+    (6 171 035 648 B, 91 entries) into `../guac-artifacts/`; the partial file and `.aria2` were deleted.
+    The 3 DMGs needed are OS `087-86698-044.dmg`, Cryptex1,SystemOS `087-86593-047.dmg`,
+    Cryptex1,AppOS `087-86715-047.dmg`, extracted into `../guac-artifacts/ipsw-dmg/` (4.73 GB / 2.74 GB / 10 MB).
+    The OS image is UDIF (`koly` trailer), the two cryptexes are raw APFS (`NXSB` at offset 32).
+    apfs-fuse reads all three; OS volume reports 16.7.16 / 20H392, `usr/lib/dyld` 922 912 B (LZBITMAP OK).
+    Logical sizes: os 7.72 GiB / 179 359 files, SystemOS 3.13 GiB / 1 457 files, AppOS 7.9 MB.
+  - Stage-2 boot image `shim/out/ios16-boot.img` (26 132 480 B, sha256 5785aad2…):
+    `CPUS=8 TOUCH=1 KEYS=1 USB=2` + full iOS boot-args
+    (`rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1
+    launchd_unsecure_cache=1 sweetfb_hz=30 sweetfb_noconsole=1`), ADT `guac-hi.adt` identical to
+    `guac-final.adt` (105 904 B, GPU firmware + haptics). Live console over USB via `tools/sweet-usbnet.sh`.
 - Network lesson (this machine, 2026-11-11): from WSL the Apple CDN crawls (10-300 KB/s, 25-40% loss to
   1.1.1.1); the same URL via Windows `curl.exe --http1.1 -r` with 4 parallel ranges does 5.5 MB/s from the
   same Wi-Fi. Download the IPSW on the Windows side, not in WSL.
-- Unfinished: finish the IPSW, `unzip` those DMGs, `tools/mkiosroot.sh os dmg sysos dmg appos dmg ios16-root.img
-  16G` as root, `sweet-root-tweaks.py` (launchd cache), `img2simg`, then **ask the user before**
-  `fastboot flash userdata ios16-root.simg` (wipes LineageOS and all data; firmware dumps incl. modem/persist
-  are in `../guac-artifacts/backup/guac-backup/`). Boot image for stage 2 = full iOS boot-args
-  (docs/guacamole.md: `rd=ufsroot0 ... sweetfb_noconsole=1`) + `sweetusb=`/`sweettouch=`/`sweetkeys=`.
+- Root image ready (not flashed): `../guac-artifacts/ios16-root.simg`, 12 145 254 696 B, 16 GiB HFS+
+  (case-sensitive, journaled), 12 GiB used, 181 772 files, `fsck_hfs` clean; android sparse header
+  `0xed26ff3a`, 4 194 304 × 4096 B blocks, 27 811 chunks; sha256 `884f154b…`.
+  Built from the 3 CRC-verified DMGs with `tools/mkiosroot.sh` on ext4 (`/root/ios16-build/`), then
+  `sweet-root-tweaks.py --no-bbd` (see below), fsck, `img2simg`, copied to Windows.
+  - launchd cache: 530 daemons, 7 × `_PanicOnCrasX`, `com.apple.CommCenter` + `com.apple.fairplayd.H2`
+    removed, `com.sweet.autorun` added, backboardd → **`/usr/libexec/backboardd`**.
+  - Deviation from the docstring: the tweak normally points backboardd at `/usr/libexec/sweet-bbd`,
+    which is userland (installed later through SWEETBOX). A fresh IPSW root has no such binary, so the job
+    would fail and the window server would never start. Added the `--no-bbd` flag for exactly this case;
+    re-run the tweaks (or install the SWEETBOX box) once `userland/bbd` + `libsweet-bbd.dylib` exist.
+  - Warning from the tweak: "no mobileactivationd system container; skipped data ark" — a fresh root has
+    no system data container yet; activation still comes from the Hactivation branch (`/chosen`
+    security-status, tools/mkadt.py). Untested here.
+  - dyld shared cache: 44 files, all hard links; keybag and logd stores present; containers created.
+- In progress / next: connect the phone, `fastboot flash userdata ../guac-artifacts/ios16-root.simg`,
+  then `fastboot boot shim/out/ios16-boot.img`. **Ask the user first** — the flash wipes LineageOS and all
+  user data (firmware dumps incl. modem/persist in `../guac-artifacts/backup/guac-backup/`, 15 files,
+  880 MiB). Phone was not visible in `adb`/`fastboot` at 22:45.
+- Stage-2 boot: `fastboot boot shim/out/ios16-boot.img`, then `tools/sweet-usbnet.sh logs/live-*.txt`
+  on the PC (phone CDC-ECM at 192.168.7.2, console UDP to 192.168.7.1:5140).
 - Phone state: last boot was `fastboot boot shim/out/out.img` (probe, read-only): UFS/GPT read OK, then the real
   kernel reached the XNU console (`FrameWork successfully initialized`, `ncache: 8 CPU(s){,}`), boot-args had
   no `rd=` and no `ufsrw`. A plain reboot returns to Android.
