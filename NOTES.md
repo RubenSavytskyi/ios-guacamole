@@ -1,3 +1,32 @@
+# Active handoff — clean install of iOS 16 root on a second OnePlus 7 Pro (2026-11-11 20:55, opencode)
+
+- Goal: reproduce the iOS 16.7.16 root on another guacamole (GM1911, serial 0ea51515, slot b, Android 16
+  LineageOS 23.2 on OOS 12 vendor). Nothing flashed yet; `userdata` untouched (227 GB f2fs, LineageOS live).
+- Done on this machine (Windows + WSL2 Ubuntu):
+  - WSL2 kernel 6.6.87.2 rebuilt with `CONFIG_HFSPLUS_FS=y` (Microsoft's kernel has no HFS+ module):
+    `~/wslk`, binary `C:\Users\ruvim\wsl-kernel\bzImage`, selected by `C:\Users\ruvim\.wslconfig` (delete that
+    file to go back). Verified: `mount -t hfsplus -o loop,force` read-write keeps 0:0, setuid and symlinks.
+  - `apfs-fuse` (sgan81) built from source into `~/apfs-fuse/build/apfs-fuse`, symlinked
+    `/usr/local/bin/apfs-fuse` (Ubuntu has no package; libfsapfs 20201107 is only a fallback: it may lack
+    LZBITMAP). `mkfs.hfsplus`, `fsapfsmount`, `dmg2img`, `img2simg`, `lzfse` installed.
+  - tools/mkiosroot.sh: the APFS side now has two backends (apfs-fuse when present, else fsapfsmount +
+    dmg2img for the UDIF OS image) and `vol_root()` finds the volume directory instead of hardcoding
+    `os/root`. apfs-fuse path unchanged in behaviour, not yet run end to end.
+  - IPSW `iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw` in `../guac-artifacts/` (outside git):
+    ~5.5 GB of 6.17 GB, with the `.aria2` control file, so **`aria2c -c` resumes**; the 3 DMGs needed are
+    OS `087-86698-044.dmg`, Cryptex1,SystemOS `087-86593-047.dmg`, Cryptex1,AppOS `087-86715-047.dmg`.
+- Network lesson (this machine, 2026-11-11): from WSL the Apple CDN crawls (10-300 KB/s, 25-40% loss to
+  1.1.1.1); the same URL via Windows `curl.exe --http1.1 -r` with 4 parallel ranges does 5.5 MB/s from the
+  same Wi-Fi. Download the IPSW on the Windows side, not in WSL.
+- Unfinished: finish the IPSW, `unzip` those DMGs, `tools/mkiosroot.sh os dmg sysos dmg appos dmg ios16-root.img
+  16G` as root, `sweet-root-tweaks.py` (launchd cache), `img2simg`, then **ask the user before**
+  `fastboot flash userdata ios16-root.simg` (wipes LineageOS and all data; firmware dumps incl. modem/persist
+  are in `../guac-artifacts/backup/guac-backup/`). Boot image for stage 2 = full iOS boot-args
+  (docs/guacamole.md: `rd=ufsroot0 ... sweetfb_noconsole=1`) + `sweetusb=`/`sweettouch=`/`sweetkeys=`.
+- Phone state: last boot was `fastboot boot shim/out/out.img` (probe, read-only): UFS/GPT read OK, then the real
+  kernel reached the XNU console (`FrameWork successfully initialized`, `ncache: 8 CPU(s){,}`), boot-args had
+  no `rd=` and no `ufsrw`. A plain reboot returns to Android.
+
 # Active handoff — iOS haptics reach the motor; AW8697 wedges -> REQUEST-J / 0258 (2026-11-11 02:35, Claude)
 
 - Full iOS haptic chain works: MG DeviceSupportsHaptics=true (new) + DeviceSupportsClosedLoopHaptics=true. VirtualAudio

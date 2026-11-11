@@ -5,7 +5,9 @@
 #   mkiosroot.sh OS.dmg SYSTEMOS.dmg APPOS.dmg OUT.img [SIZE]     (SIZE default 16G)
 #
 # The IPSW images are raw APFS with LZBITMAP-compressed files: they are read
-# through apfs-fuse (decompressing), so the HFS+ copy is uncompressed. On a
+# through apfs-fuse (decompressing), so the HFS+ copy is uncompressed. Where
+# apfs-fuse is not packaged (Ubuntu), libfsapfs (fsapfsmount, read-only) is
+# used instead; the OS image is UDIF and is expanded with dmg2img first. On a
 # device /private/preboot is its own volume holding the cryptexes, which
 # /System/Cryptexes/{OS,App} link to; here they live inside the one volume.
 # Owners, modes, symlinks and hard links are preserved (rsync -aH as root).
@@ -22,17 +24,26 @@ set -euo pipefail
 os=$(realpath "$1") sysos=$(realpath "$2") appos=$(realpath "$3") out=$4 size=${5:-16G}
 [[ ! -e $out ]] || { echo "refusing to overwrite $out" >&2; exit 1; }
 
-# Pre-flight tool check
+# Pre-flight tool check: apfs-fuse, or libfsapfs + dmg2img for UDIF images.
 missing_tools=()
-for tool in apfs-fuse mkfs.hfsplus rsync; do
+for tool in mkfs.hfsplus rsync; do
 	command -v "$tool" >/dev/null 2>&1 || missing_tools+=("$tool")
 done
+
+if command -v apfs-fuse >/dev/null 2>&1; then
+	apfs_backend=fuse
+elif command -v fsapfsmount >/dev/null 2>&1 && command -v dmg2img >/dev/null 2>&1; then
+	apfs_backend=fsapfs
+else
+	missing_tools+=("apfs-fuse (or fsapfsmount + dmg2img)")
+fi
 
 if [[ ${#missing_tools[@]} -gt 0 ]]; then
 	echo "Error: missing required host utilities: ${missing_tools[*]}" >&2
 	echo "  Install instructions:" >&2
 	echo "    Arch Linux:    sudo pacman -S apfs-fuse hfsprogs rsync" >&2
 	echo "    Ubuntu/Debian: sudo apt install apfs-fuse hfsprogs rsync" >&2
+	echo "                   (no apfs-fuse: libfsapfs-utils dmg2img)" >&2
 	echo "    Fedora:        sudo dnf install apfs-fuse hfsplus-tools rsync" >&2
 	exit 1
 fi
@@ -49,7 +60,7 @@ cleanup() {
 	done
 	# Never recurse into a directory that is still mounted (the root is writable).
 	if [[ $busy == 0 ]]; then
-		rm -f "$work"/*.dmg
+		rm -f "$work"/*.dmg "$work"/*.raw
 		rmdir "$work"/* "$work" 2>/dev/null || true
 	else
 		echo "still mounted under $work: left in place" >&2
@@ -57,19 +68,70 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# apfs-fuse splits its options on ',' (e.g. in iPhone10,3 paths): use links.
-# Keep the .dmg name: apfs-fuse only parses UDIF images (the OS one is UDIF,
-# the cryptexes are raw APFS) when the file name ends in .dmg.
-apfs_mount() {
-	ln -s "$1" "$work/$2.dmg"
-	mkdir "$work/$2"
-	# As root: a user's FUSE mount is unreadable to the root rsync below.
-	sudo "$(command -v apfs-fuse)" "$work/$2.dmg" "$work/$2"
-	mounts+=("$work/$2")
+# A UDIF (.dmg) container ends with a 512-byte 'koly' trailer; the cryptex
+# images inside an IPSW are raw APFS.
+is_udif() {
+	[[ $(tail -c 4 "$1" | od -An -tx1 | tr -d ' \n') == 6b6f6c79 ]]
 }
+
+apfs_mount() {
+	local src=$1 name=$2 img
+	mkdir -p "$work/$name"
+
+	if [[ $apfs_backend == fuse ]]; then
+		# apfs-fuse splits its options on ',' (e.g. in iPhone10,3 paths): use links.
+		# Keep the .dmg name: apfs-fuse only parses UDIF images (the OS one is UDIF,
+		# the cryptexes are raw APFS) when the file name ends in .dmg.
+		ln -s "$src" "$work/$name.dmg"
+		# As root: a user's FUSE mount is unreadable to the root rsync below.
+		sudo "$(command -v apfs-fuse)" "$work/$name.dmg" "$work/$name"
+		mounts+=("$work/$name")
+		return
+	fi
+
+	# libfsapfs reads raw APFS only: expand the UDIF OS image first.
+	img=$src
+	if is_udif "$src"; then
+		img=$work/$name.raw
+		echo "expanding UDIF $src -> $img"
+		dmg2img -s "$src" "$img" || return 1
+	fi
+	sudo fsapfsmount -f all "$img" "$work/$name" &
+	local i
+	for ((i = 0; i < 240; i++)); do
+		mountpoint -q "$work/$name" && break
+		sleep 0.5
+	done
+	if ! mountpoint -q "$work/$name"; then
+		echo "Error: fsapfsmount failed on $src" >&2
+		return 1
+	fi
+	mounts+=("$work/$name")
+}
+
+# Root of the iOS volume inside a container mount: apfs-fuse exposes one
+# directory per volume (the sealed system volume is named "root"); libfsapfs
+# with -f all does the same, but fall back to searching for System/Library.
+vol_root() {
+	local mp=$1 d
+	for d in "$mp/root" "$mp"; do
+		if [[ -d $d/System/Library ]]; then
+			echo "$d"
+			return 0
+		fi
+	done
+	d=$(find "$mp" -maxdepth 3 -type d -path '*/System/Library' 2>/dev/null | head -1)
+	[[ -n $d ]] || return 1
+	echo "${d%/System/Library}"
+}
+
 apfs_mount "$os" os
 apfs_mount "$sysos" sysos
 apfs_mount "$appos" appos
+
+os_root=$(vol_root "$work/os") || { echo "Error: no iOS volume in $os" >&2; exit 1; }
+sysos_root=$(vol_root "$work/sysos") || { echo "Error: no volume in $sysos" >&2; exit 1; }
+appos_root=$(vol_root "$work/appos") || { echo "Error: no volume in $appos" >&2; exit 1; }
 
 truncate -s "$size" "$out"
 mkfs.hfsplus -s -J -v iOSRoot "$out"
@@ -82,9 +144,9 @@ copy() {
 	sudo mkdir -p "$2"
 	sudo rsync -aH --numeric-ids "$1/" "$2/"
 }
-copy "$work/os/root" "$work/root"
-copy "$work/sysos/root" "$work/root/private/preboot/Cryptexes/OS"
-copy "$work/appos/root" "$work/root/private/preboot/Cryptexes/App"
+copy "$os_root" "$work/root"
+copy "$sysos_root" "$work/root/private/preboot/Cryptexes/OS"
+copy "$appos_root" "$work/root/private/preboot/Cryptexes/App"
 
 # Shared cache where dyld looks at ignition level 1: hard links, no extra space.
 dsc=private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld
