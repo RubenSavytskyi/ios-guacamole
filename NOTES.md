@@ -1,4 +1,52 @@
-# Active handoff — graphics: GPU backend is up, Metal clients refused on the shader-cache path (2026-11-12, opencode)
+# Active handoff — graphics: Metal runs, ~31 fps and 0.5-4.6 s frame stalls (2026-11-12, opencode)
+
+- **Metal works end to end now.** `guac-artifacts/ios16-root-gpu.simg` (12 177 438 940 B, sha256
+  `fd14beed…`) flashed to `userdata`; boot images `shim/out/ios16-boot-gpu1-clean.img` (60 Hz) and
+  `shim/out/ios16-boot-gpu1-c90.img` (panel 90 Hz). The user sees blur, wallpapers and real animations:
+  "це вже абсолютна інша справа". `refused 0, opened 8`, every client logs
+  `device Turnip Adreno (TM) 640 in 236-1059 ms (cache /var/local/m2v-cache/<prog>)` and a non-zero
+  `images: … libvulkan_freedreno 0x…`.
+- **Tearing fixed by removing `sweetfb_vsync`.** That arg disables 0198's panel-refresh measurement, so the
+  frame timer ran on its own clock. With 0198 measuring the panel, tearing is "майже повністю ліквідовані…
+  дуже рідко" (user). Colour shifts: none.
+- **90 Hz is real** (`sweetfb90=1`, DCS `53 30`, 0199): the timer locks to the panel and the window server
+  reads `IOMFBDisplayRefresh` = 90. But **60 and 90 Hz measure the same** (~29-31 swaps/s, user: "так само,
+  абсолютно без змін"), so the panel is not the limiter — do not spend more cycles on Hz until fps > 60.
+- **The average hides freezes, not a low steady rate.** Ring, 5 s windows: 144 swaps (28.7/s) with gaps
+  `<17 ms` 97, `<34` 17, `<67` 25, `more` 5, longest gap **4599 ms**; another window 69 swaps (13.7/s).
+  So the good stretches already run at ~83 fps and 5 stalls eat ~2.3 s of every 5 s window.
+- **The kernel side is exonerated** by its own counters: `SwapWait 284 (timed out 0)`, `CPU-copied Metal
+  frames 0-2`, `freed unfinished 0`, `re-swapped pending surface 0`, `no new GPU work at swap 2`,
+  `GPU busy 42-48%`. The stall lives in userspace (backboardd's bridge / CoreAnimation), or in a GPU blit
+  that takes hundreds of ms; nothing in the fb path blocks.
+- **Two findings in the bundle, both fixed in `75c0e1f` (CI run pending):**
+  1. `backboardd`'s present path did **69 texture reads per frame** (`prePresentBlackSamples`: 64
+     single-pixel `getBytes` + five 8x8) purely for the log. Now gated behind `sweetmtlblack=1`, off by
+     default. Each `getBytes` on a Vulkan-backed drawable maps and may wait for the frame's own work.
+  2. The bridge's telemetry (pipeline/library/function creation, `commit-to-complete`, drawable and
+     resource waits, the runtime's VkPipeline makings, the last 20 commits with their own timestamps) went
+     only to `/var/local/mtl2.log`, which needs a recovery to read. New `native_bridge_metal_short` emits
+     the same numbers as rows of at most 54 characters; backboardd writes them to `/dev/console` every 5 s
+     (`MTL2[..]: tel <row>`), so the ring carries them.
+- **Dump tool** `shim/ufs.c` now prints them (`tel` ring of 56 rows, prefix stripped, last snapshot only);
+  `SWEETLOG_LINE` is 240, the screen blocks are 3/3/18/4 rows so everything fits 60x65. Rebuild:
+  `BOARD=guacamole shim/build.sh` then `python3 tools/mkguacboot.py ../guac-artifacts/backup/guac-backup/boot_b.img shim/out/Image shim/out/logdump-gpu.img`
+  (current `logdump-gpu.img` sha256 `c2c57ba4…`).
+- **Next, in this order:**
+  1. Wait for the metal2 CI run for `75c0e1f`, download the `metal2` artifact (`SweetMetal2.bundle`).
+  2. Reflash `userdata` with the same root image plus the new bundle (`%TEMP%\opencode\img-pack.sh`,
+     mounts `/var/tmp/ios16-root.raw` rw, then `img2simg`; the raw image already carries the bundle from
+     `art-metal2b`). **Ask the user first** — it replaces the iOS install.
+  3. Boot `ios16-boot-gpu1-c60lock.img` (60 Hz, panel-locked timer, no console), swipe 20 s, pull the ring
+     with `logdump-gpu.img`: the `tel` rows name the stall (pipeline time vs wait vs commit-to-complete).
+  4. Then decide: pipeline-cache work, drawable wait, or the ~83 fps bursts' pacing.
+- Free experiments already ruled out by the user: a second identical swipe pass is **not** smoother (so it
+  is not shader-compile warm-up), Reduce Transparency changes nothing (so it is not blur fill rate), and
+  the 4.6 s stall is not panel refresh.
+- Still no live shell on the device: no TWRP (neither image boots now), `usbipd`/`cdc_ether` unfinished in
+  `~/wslk`. Everything above came from `fastboot boot logdump-gpu.img` and the user reading the screen.
+
+# Previous handoff — graphics: GPU backend is up, Metal clients refused on the shader-cache path (2026-11-12, opencode)
 
 - **First GPU boot done, and the kernel side works end to end.** Boot `shim/out/ios16-boot-gpu1.img` +
   root image `../guac-artifacts/ios16-root-gpu.simg`: the ring shows every GPU stage 1-10, then
