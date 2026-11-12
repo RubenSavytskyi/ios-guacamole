@@ -1,5 +1,38 @@
 # Active handoff — iOS boots to the lock screen; only touch is left (2026-11-12, opencode)
 
+### >>> UPDATE 2026-11-12 (latest): CI through a fork + bit-bang driver 0157 <<<
+
+- CI unlocked without a local macOS: fork **`RubenSavytskyi/ios-guacamole`** (public, Actions enabled via
+  API), branch `guacamole-touch` force-pushed to the fork's `main` and set as its default branch.
+  GitHub retired `macos-14` on 2026-11-02 (jobs are cancelled at queue time with
+  `The configuration 'macos-14-arm64-us-default' is not supported`, 0 steps, conclusion `cancelled`),
+  so the workflow is now `runs-on: macos-15` and also copies `xnu/local/*.patch` into `dxb/patches/`
+  (`0001-iorpc-kernelcontent.patch`: Xcode 16+ `iig` emits `IORPC.kernelContent`).
+  Push with Windows git (Credential Manager, account `RubenSavytskyi`):
+  `git -C "<repo>" push https://github.com/RubenSavytskyi/ios-guacamole.git guacamole-touch` and
+  `… push --force … guacamole-touch:main` (a push to `main` is what starts the build). API helpers:
+  `%TEMP%\opencode\gh-whoami.ps1`, `gh-fork.ps1`, `gh-dispatch.ps1`, `gh-runs.ps1`, `gh-jobdiag.ps1`.
+  The workflow has `concurrency: xnu-${{ github.ref }}` with `cancel-in-progress: true`, so each new
+  push to `main` cancels the build already running.
+- Builds: baseline of the tip (`5f3cea7`, macos-15 fix) reached the **Build** step and was then
+  cancelled by the next push (run `43194865341`); the bit-bang build is run **`43196064388`** on
+  `6567cf1`.
+- **New approach (patch 0157) — bit-bang I2C in the driver, QUP untouched.** `bsd/dev/sweet_touch.c`
+  (`xnu/patches/0157-guacamole-touch-bitbang.patch`, generated from the fully patched file kept in
+  `C:\Users\ruvim\AppData\Local\Temp\opencode\recon`). Default `sweetbb=1`; `sweetbb=0` keeps the old
+  SE path. SDA/SCL = GPIO55/56, mux 0, pull-up, open-drain (drive low = output enable + latch 0,
+  release = input; never driven high). Timing from `mach_absolute_time()` with the tick rate derived
+  from `absolutetime_to_nanoseconds()` — no GCC clock votes and no SE access at all. `sweetbbkhz`
+  (default 100) sets the bus clock. The read path keeps the Linux STOP_STRETCH shape: pointer write
+  leaves SCL low, the read continues with a repeated START. Probes are retried 3x with a reset.
+  On-screen diagnostics: pad cfg/io dump, `line test sda pd/pu=… scl pd/pu=…` (do the pads move, is
+  the bus held low), a 9-clock bus clear, idle levels, one line per transfer (`bb xfer … err=`), and
+  `s6sy761 attempt=… err=… boot=…`.
+- Footnote: XNU's `delay(int)` takes **microseconds** (`delay_for_interval(usec, NSEC_PER_USEC)`), so
+  the SE driver's `delay(1)` poll loops are 1 µs steps, not 1 ms.
+- Pending: `shim/out/ios16-boot-touchread.img` (the `0x2008` read probe) was booted; its result has
+  not been observed yet.
+
 - State: the iOS 16.7.16 root (12 GiB HFS+, sparse `../guac-artifacts/ios16-root.simg`, sha256 `884f154b…`)
   is flashed to `userdata` (`/dev/block/sda19`) and boots to the lock screen on the phone (GM1911,
   serial 0ea51515, bootloader unlocked, slot b). Nothing but userdata was flashed; every test uses
@@ -64,9 +97,9 @@
   `CPUS=8 TOUCH=1 KEYS=1 USB=0 tools/guac-mkboot.sh <patched kernel> <stock boot_b.img> shim/out/Image out.img "<args>"`.
   To revert, copy `kernel.development.sweet` back over the variant name.
 - Device recovery after a reset: hold Power ~15-20 s, then Power+Volume Down for fastboot.
-- Push/CI: WSL git has no credentials. Windows git has `RubenSavytskyi` in Credential Manager, but that
-  account has no write access to `coreycusick/ios-guacamole` (403) and has no fork. Kernel changes
-  therefore need either someone with push access or local binary patches like the one above.
+- Push/CI: WSL git has no credentials; Windows git has `RubenSavytskyi` in Credential Manager. That
+  account has no write access to `coreycusick/ios-guacamole` (403), but the fork above is ours, its
+  Actions build the kernel, and the `xnu-kernel` artifact is public — see the update block at the top.
 
 # Active handoff — clean install of iOS 16 root on a second OnePlus 7 Pro (2026-11-11 22:30, opencode)
 
