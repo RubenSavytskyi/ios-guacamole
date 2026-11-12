@@ -273,7 +273,7 @@ void test_ufs(void)
  */
 #define SWEETLOG_RING_MAX	(4u << 20)
 #define SWEETLOG_BLOCKS		(1u + SWEETLOG_RING_MAX / BLOCK)
-#define SWEETLOG_HITS		24
+#define SWEETLOG_HITS		32
 #define SWEETLOG_LINE		112
 
 static uint32_t le32(const uint8_t *p)
@@ -360,7 +360,14 @@ static void log_line(struct log_state *p)
 {
 	if (!p->curlen)
 		return;
-	if (has_word(p->cur, "SWEET TOUCH") || has_word(p->cur, "SWEET RPMH")) {
+	/*
+	 * Keep the lines that matter for the graphics bring-up as well as touch:
+	 * the framebuffer driver's 5 s stats, the GPU stages and the Metal plugin.
+	 */
+	if (has_word(p->cur, "SWEET TOUCH") || has_word(p->cur, "SWEET RPMH") ||
+	    has_word(p->cur, "SWEET FB") || has_word(p->cur, "SWEET GPU") ||
+	    has_word(p->cur, "MTL2") || has_word(p->cur, "RedwoodGPU") ||
+	    has_word(p->cur, "SweetMetal") || has_word(p->cur, "IOAccelerator")) {
 		log_hit(&p->hits, p->cur, p->curlen);
 	} else {
 		char *d = p->tail[p->tpos];
@@ -481,7 +488,7 @@ sweet_log_dump(void)
 	}
 	log_line(&st_log);	/* final unterminated line */
 
-	con_str("LOG", "last SWEET TOUCH / RPMH lines:");
+	con_str("LOG", "last SWEET TOUCH/FB/GPU, MTL2 lines:");
 	for (unsigned i = 0; i < st_log.hits.n; i++) {
 		unsigned idx = (st_log.hits.pos + SWEETLOG_HITS - st_log.hits.n + i) % SWEETLOG_HITS;
 		con_skip();

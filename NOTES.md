@@ -1,4 +1,33 @@
-# Active handoff — iOS 16.7.16 boots to the lock screen and touch works (2026-11-12, opencode)
+# Active handoff — graphics bring-up: Metal bundle installed, waiting for the first GPU boot (2026-11-12, opencode)
+
+- Why: after the touch milestone the flashed root had **no** `/System/Library/Extensions/SweetMetal2.bundle`,
+  no `/var/jb`, no `/var/local`, and boot args had no `sweetmtl`, so Metal never loaded. The lock screen
+  rendered through a non-GPU path: black/coloured patches, shifts, flicker, wrong colours, stuttering
+  animations (user report, 2026-11-12). No Wi-Fi/SSH on the phone yet, so all evidence is the screen and
+  `logdump`.
+- Metal userland built in CI (new `.github/workflows/metal2.yml`, `macos-15-intel`): Turnip
+  (`tools/build-turnip-ios.sh`), the Rust bridge (`tools/build-m2v-bridge.sh`) and
+  `userland/metal2/build.sh` → `SweetMetal2.bundle` + `libvulkan_freedreno.dylib` + `userland/out` tools.
+  Run **`43213510975`** (`bbd4cc9`) succeeded; artifact `metal2` (56 MB). Earlier run `43211755796` failed
+  in Deps (`rustup-init: command not found`); the workflow now installs Rust via rustup.rs.
+- Root image `../guac-artifacts/ios16-root-gpu.simg` (12 177 459 280 B, sha256 `544f7570…`, fsck clean) =
+  `ios16-root.simg` unsparsed + `/System/Library/Extensions/SweetMetal2.bundle` +
+  `/private/var/local/mtl2-clients` (`*`) + empty 0666 `mtl2.log` + mobile `.GlobalPreferences.plist`
+  with `CAEnableFramebufferCompression` / `CAEnableIOSurfaceCompression` / `CAEnableDeepFramebuffer` /
+  `WebKit2GPUProcessForDOMRendering` = false. Built by `%TEMP%\opencode\img-pack.sh` (mounts
+  `/var/tmp/ios16-root.raw` rw, runs `img-setup.py`, `sync`, `umount`, `fsck -fy`, `img2simg`).
+- Boot image `shim/out/ios16-boot-gpu1.img` (sha256 `3cb325aa…`), kernel `xnu/out-0257` (touch included),
+  args: `sweetmtl=2 sweetgpu=11 sweetcpufreq=2 sweetfb_refresh=60 sweetfb_vsync=60 sweetfb_hz=60
+  sweetfbgpu=1 sweetfbatswap=1 sweetfbtop=1 sweetfbsync=1 sweetfbcompose=1 sweetfblock=1 sweetfb90=0
+  sweettouchdelay=10` (console visible).
+- `shim/out/logdump-gpu.img` (sha256 `3ba11139…`): `shim/ufs.c` now also keeps `SWEET FB`, `SWEET GPU`,
+  `MTL2`, `RedwoodGPU`, `SweetMetal`, `IOAccelerator` lines (32 hits, was 24, touch/RPMH only).
+- Next: flash `userdata` (user approved the wipe) → `fastboot boot ios16-boot-gpu1.img` → check
+  `IOAcceleratorES published (Metal: SweetMetal2)`, `RedwoodGPU ready after … s`, `SWEET FB: 5s: …`
+  stats and how the lock screen looks/animates. Then attack the top bottleneck (CPU compose for >2
+  layers, bridge cost, blur, YCbCr conversion).
+
+# Previous handoff — iOS 16.7.16 boots to the lock screen and touch works (2026-11-12, opencode)
 
 ### >>> UPDATE 2026-11-12 (latest): TOUCH WORKS — patch 0257 (run 43203803753, image bb12) <<<
 
