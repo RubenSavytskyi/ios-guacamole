@@ -1,4 +1,4 @@
-# Active handoff — iOS boots to the lock screen; only touch is left (2026-11-12 00:45, opencode)
+# Active handoff — iOS boots to the lock screen; only touch is left (2026-11-12, opencode)
 
 - State: the iOS 16.7.16 root (12 GiB HFS+, sparse `../guac-artifacts/ios16-root.simg`, sha256 `884f154b…`)
   is flashed to `userdata` (`/dev/block/sda19`) and boots to the lock screen on the phone (GM1911,
@@ -7,28 +7,62 @@
 - Useful boot images (all `sweetusb=0`, the only value known to boot):
   - `shim/out/ios16-boot-clean.img` — clean UI (`sweetfb_noconsole=1`), touch driver off.
   - `shim/out/ios16-boot-touch10.img` — console visible, `sweettouchdelay=10`; boots fine, touch dead.
-  - `shim/out/ios16-boot-touchkern.img` — clean UI + the patched kernel described below (touch fix).
+  - `shim/out/ios16-boot-touchkern.img` — clean UI + the first patched kernel (touch fix).
   - `shim/out/logdump.img` — shim only (no XNU payload): decodes the SWEETLOG ring at the end of
     `userdata` and prints the last `SWEET TOUCH`/`SWEET RPMH` lines of the previous boot on screen.
-- Touch root cause (from that ring): `sweet_touch.c` stops in `touch_se_init()`:
+  - `shim/out/ios16-boot-touchopen10.img` — gate branch removed only (`--nop-only`); **boots**, touch
+    dead. Log: the driver runs to the end of `touch_se_init()` and votes RPMh L17A, then every probe
+    transfer to `0x48` times out (`err=60`, `tx=1 rx=0 status=0`, five attempts printed).
+  - `shim/out/ios16-boot-touchlate10.img` / `…late45.img` — gate removed + `0x2008` write moved to the
+    end of the SE init (`--late`); **hard hang**: screen goes black ~1-2 s in (late10) or after the
+    lock screen (late45), no `panic(cpu …)` text, no panic line in the ring.
+  - `shim/out/ios16-boot-touchread.img` (sha256 `87d5fe00…`) — diagnostic `--read-page`: only the
+    `ios=` field of the SE print reads `0x2008` (`ldr w10,[x10,#0x2008]` at `0xfffffe00074fb5b4`, gate
+    stays active, nothing else changes); built, not booted yet.
+- Touch root cause (from the ring): `sweet_touch.c` stops in `touch_se_init()`:
   `SWEET TOUCH: se fw=0x303 proto=3 status=0 tx=0x20102964 rx=0x20104900 ios=0`, then
   `need ABL-loaded I2C firmware and 32-bit FIFOs; probes skipped`. Every gate term passes except
   `touch_rd(st.se, 0x64) & 1`: `0x64` is `GENI_IF_DISABLE_RO` and bit 0 is `FIFO_IF_DISABLE` — ABL left
-  the SE configured for DMA/GSI. Mainline `geni_configure_xfer_mode()` clears `FIFO_IF_DISABLE`
-  (bit 0 of `SE_FIFO_IF_DISABLE`, `0x2008`) when switching to FIFO mode; our driver never does.
+  the SE configured for DMA/GSI (downstream `i2c-qcom-geni.c` reads the same bit and, when set, uses GSI
+  mode only; it never switches back to FIFO).
+- With the gate removed the driver's own init is not enough: `touch_se_init()` completes (packing
+  `0x7f8fe/0xffcfe`), the RPMh `ldoa17` vote completes, then every probe transfer to `0x48` times out
+  (`err=60`, `tx=1 rx=0 status=0`) — the SE does not execute FIFO commands.
+- Why the `0x2008` write cannot be the answer on this SoC (observation + source reading): the
+  msm-4.14/LineageOS SM8150 GENI sources (`include/linux/qcom-geni-se.h`,
+  `drivers/tty/serial/msm_geni_serial.c`, `drivers/i2c/busses/i2c-qcom-geni.c`) define only
+  `GENI_CLK_CTRL_RO 0x60` and `GENI_IF_FIFO_DISABLE_RO 0x64`; there is no `0x2000/0x2004/0x2008`
+  register anywhere. Those three are the GENI **v2** map in mainline (`SE_GENI_FW_REVISION 0x1000`,
+  `SE_GENI_CFG_RAMN 0x1010`, `SE_GENI_CLK_CTRL 0x2000`, `SE_DMA_IF_EN 0x2004`,
+  `SE_FIFO_IF_DISABLE 0x2008`), used only by SoCs where Linux itself loads the SE firmware
+  (`geni_load_se_firmware()` with a `firmware-name` DT property). SM8150 is GENI v1: the mode is fixed
+  by the firmware the boot chain loads, and the AP has no writable mirror. A store to `0x2008` is a
+  store into an address with no register behind it → the NoC never answers, the SoC hangs/resets
+  (black screen, no Swift panic), which matches every observed run. `--read-page` is the pending
+  confirmation (a read of the same address either returns a value or hangs the same way).
+- Consequence: FIFO mode cannot be switched on from the AP on this phone. Realistic paths are
+  (a) boot-chain firmware that leaves SE17 in FIFO mode (older OOS/qupfw — coreycusick's phone does;
+  risky, touches firmware partitions), (b) driver work in source — GSI mode port, or the much simpler
+  GPIO bit-bang I2C on SDA/SCL 55/56 — which needs a kernel build. The CI workflow
+  (`.github/workflows/xnu.yml`) is self-contained (`workflow_dispatch` + `macos-14`), so a public fork
+  of the repo could build and download a kernel without local macOS.
+- Why it works for coreycusick: same branch, same kernel source (our checkout is the branch tip
+  `b94a1e7` + local root commits). On his phone `0x64` bit 0 reads 0, i.e. his boot chain leaves SE17
+  in FIFO mode; ours (OOS 12 firmware/ABL) leaves it in DMA/GSI mode. It is a bootloader-state
+  difference, not a driver difference.
 - Shim workaround: dead end, do not retry. Poking `0xc80000` from the shim resets the SoC (900E
   crash-dump, or straight back to fastboot). Voting `gcc 0x52014 |= 0x1f` and reading `0x68` work, but
   the first access to `0x64`/`0x2008` still kills the machine, including after enabling the RCG root
   (`0x1e148 |= 1`). `shim/shim.c` therefore has no SE access any more.
-- Fix applied in the kernel binary instead (`tools/patch-touch-kernel.py`): inside `_touch_thread`
-  (where `touch_se_init` is inlined) two instructions change —
-  `0xfffffe00074fb5e0 ldr w8,[x8,#0x64]` -> `str wzr,[x8,#0x2008]` and
-  `0xfffffe00074fb5f0 tbnz w8,#0,<fail>` -> `nop`. `w8` is overwritten by
-  `and w8, w21, #0x3f000000` immediately after, and none of the driver's own register writes are lost
-  (0xe18/0xe1c/0x644/0x618/0x648/0x258/… still execute). Result:
-  `xnu/out-53/kernel.development.sweet-touchfix`; rebuild the image with
-  `CPUS=8 TOUCH=1 KEYS=1 USB=0 tools/guac-mkboot.sh <patched kernel> <stock boot_b.img> shim/out/Image out.img "<clean args>"`.
-  To revert, copy `kernel.development.sweet` back over the `-touchfix` name.
+- Fix attempted in the kernel binary (`tools/patch-touch-kernel.py`, variants `--nop-only`, `--late`,
+  `--read-page`, default): inside `_touch_thread` (where `touch_se_init` is inlined) the gate is
+  `0xfffffe00074fb5e0 ldr w8,[x8,#0x64]` / `0xfffffe00074fb5f0 tbnz w8,#0,<fail>`; `w8` is overwritten
+  by `and w8, w21, #0x3f000000` immediately after. `--late` writes `str wzr,[x8,#0x2008]` over the
+  `dsb osh` at `0xfffffe00074fb988`, i.e. after `0x258` (DMA mode off), `0xe18`/`0xe1c`/`0x644` and
+  `0x7c`/`0x48`/`0x278`. `--read-page` turns the `ios=` read at `0xfffffe00074fb5b4`
+  (`ldr w10,[x10,#0x908]`) into `ldr w10,[x10,#0x2008]` and changes nothing else. Rebuild with
+  `CPUS=8 TOUCH=1 KEYS=1 USB=0 tools/guac-mkboot.sh <patched kernel> <stock boot_b.img> shim/out/Image out.img "<args>"`.
+  To revert, copy `kernel.development.sweet` back over the variant name.
 - Device recovery after a reset: hold Power ~15-20 s, then Power+Volume Down for fastboot.
 - Push/CI: WSL git has no credentials. Windows git has `RubenSavytskyi` in Credential Manager, but that
   account has no write access to `coreycusick/ios-guacamole` (403) and has no fork. Kernel changes
