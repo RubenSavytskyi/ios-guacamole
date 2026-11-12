@@ -1,6 +1,23 @@
-# Active handoff — iOS boots to the lock screen; only touch is left (2026-11-12, opencode)
+# Active handoff — iOS 16.7.16 boots to the lock screen and touch works (2026-11-12, opencode)
 
-### >>> UPDATE 2026-11-12 (latest): 0157 bit-bang reached the IC; 0257 reorders the writes <<<
+### >>> UPDATE 2026-11-12 (latest): TOUCH WORKS — patch 0257 (run 43203803753, image bb12) <<<
+
+- **Result: touch is alive on the lock screen.** Image `shim/out/ios16-boot-bb12.img`
+  (sha256 `ec2ad6f7…`) packs `xnu/out-0257/kernel.development.sweet` (sha256 `5a3c0f41…`) from CI run
+  **`43203803753`** (`4cec248`, `macos-15-intel`, success in ~14 min).
+- What changed vs 0157 (all in `xnu/patches/0257-guacamole-touch-sense-order.patch`): clock-stretch
+  limit 2 ms → 100 ms, `TOUCH_FUNCTION`/`SENSE_ON` written **before** the `0x21` firmware-integrity
+  read (Linux order), writes inside the 3-attempt retry loop, bus recovery after a failed `0x21`.
+  Observation from 0157: `err=0/0/0/0/5` with `touch-function=5 sense-on=5` — the 2 ms limit aborted
+  the `0x21` read mid-byte and poisoned the bus. Most likely the longer stretch limit is what fixed
+  it, with the reordering as the second half; not yet isolated by a separate build.
+- Kept for the record: earlier run `43198941064` (`61019f6`) proved the bit-bang path talked to the IC
+  (`boot=0x20 devid=ac3761 panel 1440x3120`) but never enabled sensing.
+- Next, if wanted: pack a clean-UI image (no console) from `xnu/out-0257` for daily use
+  (`bash %TEMP%\opencode\build-bb.sh out-0257 <name>` currently hard-codes the visible console and
+  `sweettouchdelay=10`), and confirm multi-touch plus a couple of lock/unlock cycles.
+
+### Build log: 0157 bit-bang brought the IC back on the bus; 0257 finished it
 
 - CI build `43198941064` (`61019f6`, `macos-15-intel`) succeeded in ~17 min →
   `xnu/out-0157/kernel.development.sweet` (sha256 `356982d1…`); boot image
