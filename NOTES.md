@@ -1,4 +1,43 @@
-# Active handoff — graphics bring-up: Metal bundle installed, waiting for the first GPU boot (2026-11-12, opencode)
+# Active handoff — graphics: GPU backend is up, Metal clients refused on the shader-cache path (2026-11-12, opencode)
+
+- **First GPU boot done, and the kernel side works end to end.** Boot `shim/out/ios16-boot-gpu1.img` +
+  root image `../guac-artifacts/ios16-root-gpu.simg`: the ring shows every GPU stage 1-10, then
+  `SWEET GPU: IB EXECUTED … scratch 0xcafe0001 0xcafe0002 fence 0xf00dface`,
+  `backend self-test: fence 1 done=1 out 0xbeef6400`, `*** Adreno 640 backend published (RedwoodGPU) ***`,
+  pool 2736 MB. `IOAcceleratorES published (Metal: SweetMetal2)` and backboardd's own `matching1 … ->
+  RedwoodGPU` succeed after publication.
+- **Log workflow changed: stop reading the screen.** Boot `../guac-artifacts/twrp-guacamole.img`
+  (34 MB; `twrp-3.7.1_12-0-guacamole.img` does not boot) with `fastboot boot`, allow adb, then
+  `tools/sweet-log-pull.sh` → `tools/sweet-log.py` gives the whole 4 MiB ring as text (10 509 lines for the
+  last boot). `shim/out/logdump-gpu.img` remains the on-screen fallback.
+- **Real blocker, userland:** every Metal client is refused at device creation —
+  `MTL2[<pid> <prog>]: device refused in 1 ms (cache /var/local/m2v-cache/<prog>): device:
+  ShaderCache(ShaderCacheError { … PermissionDenied … os error 13 })` — 116 occurrences, for SpringBoard
+  (26), chronod, PosterBoard, every poster extension. `/var/local` is root 0755, so a non-root process
+  cannot `mkdir` the cache; `confstr(_CS_DARWIN_USER_CACHE_DIR)` returns 0 in the sandbox, so the old
+  fallback never fired. Every client also logs `libvulkan_freedreno 0x0` (Turnip not loaded) — a
+  consequence: the bridge never gets past the cache.
+- `userland/metal2/SweetMetal2.mm` now: cache candidates `$TMPDIR/m2v-<prog>` →
+  `/var/local/m2v-cache/<prog>` → `_CS_DARWIN_USER_CACHE_DIR/m2v-<prog>` (first writable wins, failures
+  logged), `dlopen(RTLD_NOW)` of `libvulkan_freedreno.dylib` with the reason logged on failure, and the
+  RedwoodGPU wait logs every 10 s instead of once. Commit `568406e`; CI run `43230013541`.
+- `%TEMP%\opencode\img-setup.py` also pre-creates `/private/var/local/m2v-cache` 0777, so root daemons
+  succeed even before the new bundle is in place.
+- **Second, unexplained:** backboardd (pid 58) logs `waiting up to 120 s for RedwoodGPU` at the very start
+  (ring line 1017) and then nothing — no `ready`, no `absent after 120 s`, no `device refused` — while all
+  58 other clients log `RedwoodGPU ready after 0 s`. The new per-10 s wait logging should show whether its
+  loop advances; if it does not, the plugin's matching call itself is blocked in backboardd.
+- Boot stats that boot: swaps 45.5/s then 29.5/s then 5.3/s, `GPU busy 0-5%`, `vsyncs sent 0`, longest
+  gaps 312/1180/754 ms, and SpringBoard threads parked in mach_msg. Expected with no Metal device; measure
+  again once Metal opens.
+- 90 Hz: `0199` switches the panel through DCS `53 30` (`sweetfb90=1`), and `0198` then measures ~88 Hz and
+  publishes it. Image `shim/out/ios16-boot-gpu1-90.img` (sha256 `19ec5ab0…`, `sweetfb_refresh=90
+  sweetfb_hz=90 sweetfb90=1`, no `sweetfb_vsync` so the panel's own rate wins) is built and ready to test
+  after Metal works at 60.
+- Next: flash the rebuilt image + new bundle → confirm `device <name> in N ms` without "refused" and
+  `GPU busy` > 0 → re-pull the ring → then the 90 Hz image.
+
+# Previous handoff — Metal bundle installed, waiting for the first GPU boot (2026-11-12, opencode)
 
 - Why: after the touch milestone the flashed root had **no** `/System/Library/Extensions/SweetMetal2.bundle`,
   no `/var/jb`, no `/var/local`, and boot args had no `sweetmtl`, so Metal never loaded. The lock screen
