@@ -101,6 +101,18 @@ static bool syncSubmitEnabled(void) {
  });
  return on;
 }
+// 0258: the per-frame black-frame sampling (64 single-pixel getBytes plus five 8x8 ones, every frame, in
+// backboardd's present path) is a diagnostic; each getBytes of a Vulkan-backed drawable costs a mapping and
+// may wait for the frame's own work, so it is off unless the kernel was booted with sweetmtlblack=1.
+static bool blackSamplingEnabled(void) {
+ static bool on;
+ static dispatch_once_t once;
+ dispatch_once(&once,^{
+  char args[1024]={};size_t size=sizeof(args)-1;
+  if(sysctlbyname("kern.bootargs",args,&size,NULL,0)==0)on=strstr(args,"sweetmtlblack=1")!=NULL;
+ });
+ return on;
+}
 static dispatch_queue_t drawablePresentQueue(void) {
  static dispatch_once_t once;
  dispatch_once(&once,^{gDrawablePresentQueue=dispatch_queue_create("org.blu-sharky.metal2.drawable-present",DISPATCH_QUEUE_SERIAL);});
@@ -1359,14 +1371,16 @@ static void scheduled(void *context);
       if(count<=3 || count%120==0)NBLOG(@"native-metal: CoreAnimation presented #%llu drawableID=%lu time=%.6f",(unsigned long long)count,(unsigned long)presented.drawableID,presented.presentedTime);
      }];
      {
-      // 0173: what CoreAnimation is about to be given
-      const unsigned black=prePresentBlackSamples(((id<CAMetalDrawable>)retainedDrawable).texture);
-      const uint64_t frames=++gPrePresentFrames;
-      if(black>=16){
-       const uint64_t b=++gPrePresentBlack;
-       if(b<=20)NBLOG(@"native-metal: pre-present black frame #%llu commit=%u %u/64 black",(unsigned long long)b,commitIndex,black);
+      // 0173: what CoreAnimation is about to be given (diagnostic, sweetmtlblack=1)
+      if(blackSamplingEnabled()){
+       const unsigned black=prePresentBlackSamples(((id<CAMetalDrawable>)retainedDrawable).texture);
+       const uint64_t frames=++gPrePresentFrames;
+       if(black>=16){
+        const uint64_t b=++gPrePresentBlack;
+        if(b<=20)NBLOG(@"native-metal: pre-present black frame #%llu commit=%u %u/64 black",(unsigned long long)b,commitIndex,black);
+       }
+       if(frames%120==0)NBLOG(@"native-metal: pre-present totals: %llu frames, %llu black",(unsigned long long)frames,(unsigned long long)gPrePresentBlack.load());
       }
-      if(frames%120==0)NBLOG(@"native-metal: pre-present totals: %llu frames, %llu black",(unsigned long long)frames,(unsigned long long)gPrePresentBlack.load());
      }
      [retainedDrawable present];
      const uint64_t issued=++gDrawablePresentIssued;
@@ -1376,7 +1390,7 @@ static void scheduled(void *context);
    const uint64_t sampleIndex=++gDrawableSamples;
    id<MTLTexture> texture=((id<CAMetalDrawable>)drawable).texture;
    const MTLPixelFormat format=texture.pixelFormat;
-   if([texture isKindOfClass:[NBTexture class]] &&
+   if(blackSamplingEnabled() && [texture isKindOfClass:[NBTexture class]] &&
       (format==MTLPixelFormatBGRA8Unorm || format==MTLPixelFormatRGBA8Unorm ||
        format==MTLPixelFormatBGRA8Unorm_sRGB || format==MTLPixelFormatRGBA8Unorm_sRGB) && texture.width>=8 && texture.height>=8) {
     const NSUInteger xs[5]={texture.width/4,3*texture.width/4,texture.width/2,texture.width/4,3*texture.width/4};
@@ -1398,7 +1412,7 @@ static void scheduled(void *context);
      std::lock_guard<std::mutex> lock(gDrawableSampleLock);
      NBLOG(@"native-metal: black-region totals at #%llu TL,TR,C,BL,BR=%llu,%llu,%llu,%llu,%llu",(unsigned long long)sampleIndex,(unsigned long long)gBlackRegionSamples[0],(unsigned long long)gBlackRegionSamples[1],(unsigned long long)gBlackRegionSamples[2],(unsigned long long)gBlackRegionSamples[3],(unsigned long long)gBlackRegionSamples[4]);
     }
-   } else if(sampleIndex<=3 || sampleIndex%30==0) {
+   } else if(blackSamplingEnabled() && (sampleIndex<=3 || sampleIndex%30==0)) {
     NBLOG(@"native-metal: frame grid #%llu skipped format=%lu texture=%@",(unsigned long long)sampleIndex,(unsigned long)format,NSStringFromClass([(id)texture class]));
    }
   } @catch(NSException *exception){NBLOG(@"native-metal: drawable present exception: %@",exception.reason);}
