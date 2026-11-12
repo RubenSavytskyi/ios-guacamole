@@ -1,0 +1,95 @@
+name: metal2
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "userland/metal2/**"
+      - "userland/turnip/**"
+      - "tools/build-turnip-ios.sh"
+      - "tools/build-m2v-bridge.sh"
+      - ".github/workflows/metal2.yml"
+
+concurrency:
+  group: metal2-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Intel image: plain macos-15 is arm64 and is capacity-starved on public
+    # repos (see xnu.yml). Homebrew lives in /usr/local here, while the build
+    # scripts still name /opt/homebrew paths, so link them.
+    runs-on: macos-15-intel
+    timeout-minutes: 300
+    env:
+      METAL_WORK: ${{ github.workspace }}/../metal-work
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deps
+        run: |
+          brew install bison flex glslang llvm rustup ninja
+          sudo mkdir -p /opt/homebrew/opt
+          for d in bison flex glslang llvm rustup; do
+            sudo ln -sfn "/usr/local/opt/$d" "/opt/homebrew/opt/$d"
+          done
+          rustup-init -y --default-toolchain 1.98.0 --profile minimal
+          rustup target add aarch64-apple-ios
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "/usr/local/opt/bison/bin" >> "$GITHUB_PATH"
+          echo "/usr/local/opt/flex/bin" >> "$GITHUB_PATH"
+          echo "DEVELOPER_DIR=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)/Contents/Developer" >> "$GITHUB_ENV"
+          sw_vers
+          xcodebuild -version
+          cargo --version
+
+      - name: Cache metal-work
+        uses: actions/cache@v4
+        with:
+          path: |
+            ../metal-work/turnip
+            ../metal-work/metal2vulkan
+            ../metal-work/m2v-bridge/target
+          key: metal-work-${{ hashFiles('userland/turnip/patches/**', 'userland/metal2/bridge/patches/**', 'tools/build-turnip-ios.sh', 'tools/build-m2v-bridge.sh') }}
+
+      - name: Turnip
+        run: bash tools/build-turnip-ios.sh
+
+      - name: Bridge
+        run: bash tools/build-m2v-bridge.sh
+
+      - name: Bundle
+        run: bash userland/metal2/build.sh
+
+      - name: Userland tools
+        run: |
+          bash userland/build.sh
+          xcrun --sdk iphoneos clang -arch arm64 -mios-version-min=16.0 -O2 -o userland/out/tsample userland/jb/tsample.c || echo "no tsample"
+          ls -la userland/out
+
+      - name: Package
+        if: always()
+        run: |
+          mkdir -p dist
+          if [ -d ../metal-work/turnip/build-ios/src/freedreno/vulkan ]; then
+            tar -C ../metal-work/turnip/build-ios/src/freedreno/vulkan -czf dist/turnip.tgz libvulkan_freedreno.dylib
+          fi
+          if [ -d userland/metal2/out ]; then
+            tar -C userland/metal2/out -czf dist/SweetMetal2.tgz SweetMetal2.bundle SweetMetal2.dSYM 2>/dev/null ||
+              tar -C userland/metal2/out -czf dist/SweetMetal2.tgz SweetMetal2.bundle
+            [ -f userland/metal2/out/m2vtest ] && cp userland/metal2/out/m2vtest dist/
+          fi
+          if [ -d userland/out ]; then tar -C userland -czf dist/userland.tgz out; fi
+          ls -la dist
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metal2
+          path: dist/*
+          if-no-files-found: warn
+          retention-days: 30
