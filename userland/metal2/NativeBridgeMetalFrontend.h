@@ -16,6 +16,8 @@ size_t native_bridge_metal_status(char *out, size_t size);
 // The pixel formats of the textures asked for (first eight distinct) and how many texture requests the runtime refused.
 size_t native_bridge_metal_formats(char *out, size_t size);
 size_t native_bridge_metal_telemetry(char *out, size_t size);
+// The same counters as a few short rows (one per line, at most 54 characters) for the 60-column in-kernel console dump.
+size_t native_bridge_metal_short(char *out, size_t size);
 // Structured cumulative artifact/driver-cache counters for offline qualification.
 struct NmbShaderCacheStats;
 bool native_bridge_metal_shader_cache_stats(struct NmbShaderCacheStats *out);

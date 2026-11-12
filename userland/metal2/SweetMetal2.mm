@@ -313,19 +313,25 @@ static io_service_t wait_for_redwood_gpu(long patience, long *waited)
 		if (vk)
 			dladdr(vk, &tu);
 		sm2_log("images: SweetMetal2 %p, libvulkan_freedreno %p", self.dli_fbase, tu.dli_fbase);
-		/* backboardd: the frontend's counters every 10 s, into /var/local/mtl2.log only (with /var/local/mtl2-telemetry) */
+		/*
+		 * backboardd: the frontend's counters every 5 s, one row per console line ("tel ..."), so the ring
+		 * dump reads them without a recovery: pipeline/shader times (T), commit-to-complete and drawable
+		 * waits (G/J), the runtime's VkPipeline makings (V), the last 20 commits with their own timestamps
+		 * and ctc (K/E). This is how a 0.5-4.6 s frame stall gets an owner.
+		 */
 		if (device && !strcmp(getprogname(), "backboardd"))
 			dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
 				for (;;) {
-					sleep(10);
-					if (access("/var/local/mtl2-telemetry", F_OK) != 0)
-						continue;
-					static char text[8192];
-					native_bridge_metal_telemetry(text, sizeof(text));
-					int fd = open("/var/local/mtl2.log", O_WRONLY | O_APPEND);
-					if (fd >= 0) {
-						dprintf(fd, "MTL2[%d %s]: telemetry\n%s", getpid(), getprogname(), text);
-						close(fd);
+					sleep(5);
+					static char text[2048];
+					native_bridge_metal_short(text, sizeof(text));
+					for (char *row = text, *nl; row != NULL && *row != 0; row = nl) {
+						nl = strchr(row, '\n');
+						if (nl != NULL)
+							*nl++ = 0;
+						else
+							nl = NULL;
+						sm2_log("tel %s", row);   /* one console line per row: the ring dump reads them */
 					}
 				}
 			});

@@ -274,7 +274,7 @@ void test_ufs(void)
 #define SWEETLOG_RING_MAX	(4u << 20)
 #define SWEETLOG_BLOCKS		(1u + SWEETLOG_RING_MAX / BLOCK)
 #define SWEETLOG_HITS		10
-#define SWEETLOG_LINE		112
+#define SWEETLOG_LINE		240
 
 static uint32_t le32(const uint8_t *p)
 {
@@ -302,6 +302,13 @@ struct log_hits {
 	unsigned nseen;
 	char gpu[12][SWEETLOG_LINE];	/* first GPU bring-up lines, even if the ring starts late */
 	unsigned ngpu;
+	char fb[8][SWEETLOG_LINE];	/* last framebuffer stats: they carry the fps/GPU-busy numbers */
+	unsigned nfb, posfb;
+	char res[8][SWEETLOG_LINE];	/* last Metal results: device opened / refused, Turnip load */
+	unsigned nres, posres;
+	char tel[56][SWEETLOG_LINE];	/* last Metal telemetry rows ("tel ...", one row per line) */
+	unsigned ntel, postel;
+	unsigned refused, opened, noload, black;
 };
 
 static void log_copy(char *d, const char *line, unsigned len)
@@ -310,6 +317,28 @@ static void log_copy(char *d, const char *line, unsigned len)
 	for (unsigned i = 0; i < k; i++)
 		d[i] = line[i];
 	d[k] = 0;
+}
+
+/* The body of an "MTL2[<pid> <name>]: tel <row>" line: the row alone, it fits one screen row. */
+static const char *log_tel_body(const char *s)
+{
+	for (; *s; s++)
+		if (s[0] == 't' && s[1] == 'e' && s[2] == 'l' && s[3] == ' ')
+			return s + 4;
+	return s;
+}
+
+static char *log_dec(char *p, unsigned v)
+{
+	char tmp[10];
+	int n = 0;
+	do {
+		tmp[n++] = (char)('0' + v % 10);
+		v /= 10;
+	} while (v);
+	while (n)
+		*p++ = tmp[--n];
+	return p;
 }
 
 static int log_gpu_line(const char *s)
@@ -326,12 +355,46 @@ static int log_rare(const char *s)
 	       has_word(s, "Metal plugin") || has_word(s, "sweetmtl");
 }
 
+static int log_metal_result(const char *s)
+{
+	return has_word(s, "MTL2") && (has_word(s, "refused") || has_word(s, "ready") ||
+	       has_word(s, "waiting") || has_word(s, "images") || has_word(s, "cache") ||
+	       has_word(s, "libvulkan"));
+}
+
 static void log_hit(struct log_hits *h, const char *line, unsigned len)
 {
 	if (log_gpu_line(line) && h->ngpu < 12)
 		log_copy(h->gpu[h->ngpu++], line, len);
 	if (log_rare(line) && h->nseen < 6)
 		log_copy(h->seen[h->nseen++], line, len);
+	if (has_word(line, "SWEET FB") && has_word(line, "5s:")) {
+		log_copy(h->fb[h->posfb], line, len);
+		h->posfb = (h->posfb + 1) % 8;
+		if (h->nfb < 8)
+			h->nfb++;
+	}
+	if (log_metal_result(line)) {
+		log_copy(h->res[h->posres], line, len);
+		h->posres = (h->posres + 1) % 8;
+		if (h->nres < 8)
+			h->nres++;
+		if (has_word(line, "refused"))
+			h->refused++;
+		else if (has_word(line, "cache"))
+			h->opened++;
+		if (has_word(line, "libvulkan"))
+			h->noload++;
+	}
+	if (has_word(line, "black") && has_word(line, "display"))
+		h->black++;
+	/* the Metal bridge's telemetry rows: "MTL2[<pid> backboardd]: tel <row>" */
+	if (has_word(line, "tel")) {
+		log_copy(h->tel[h->postel], line, len);
+		h->postel = (h->postel + 1) % 56;
+		if (h->ntel < 56)
+			h->ntel++;
+	}
 	log_copy(h->line[h->pos], line, len);
 	h->pos = (h->pos + 1) % SWEETLOG_HITS;
 	if (h->n < SWEETLOG_HITS)
@@ -516,19 +579,64 @@ sweet_log_dump(void)
 	log_line(&st_log);	/* final unterminated line */
 
 	con_str("LOG", "GPU bring-up lines (first seen):");
-	for (unsigned i = 0; i < st_log.hits.ngpu; i++) {
+	for (unsigned i = 0; i < 0 && i < st_log.hits.ngpu; i++) {
 		con_skip();
 		con_text(st_log.hits.gpu[i]);
 	}
 	con_skip();
 	con_str("LOG", "GPU / Metal init lines (first seen):");
-	for (unsigned i = 0; i < st_log.hits.nseen; i++) {
+	for (unsigned i = 0; i < 0 && i < st_log.hits.nseen; i++) {
 		con_skip();
 		con_text(st_log.hits.seen[i]);
 	}
 	con_skip();
+	{
+		char text[64], *p = text;
+		const char *a = "refused ";
+		while ((*p = *a++))
+			p++;
+		p = log_dec(p, st_log.hits.refused);
+		a = ", opened ";
+		while ((*p = *a++))
+			p++;
+		p = log_dec(p, st_log.hits.opened);
+		a = ", turnip-load-fail ";
+		while ((*p = *a++))
+			p++;
+		p = log_dec(p, st_log.hits.noload);
+		a = ", black ";
+		while ((*p = *a++))
+			p++;
+		p = log_dec(p, st_log.hits.black);
+		*p = 0;
+		con_str("LOG", text);
+	}
+	con_str("LOG", "Metal results (last 3):");
+	for (unsigned i = 0; i < st_log.hits.nres && i < 3; i++) {
+		unsigned idx = (st_log.hits.posres + 8 - st_log.hits.nres + i) % 8;
+		con_skip();
+		con_text(st_log.hits.res[idx]);
+	}
+	con_skip();
+	con_str("LOG", "framebuffer stats (last 3):");
+	for (unsigned i = 0; i < st_log.hits.nfb && i < 3; i++) {
+		unsigned idx = (st_log.hits.posfb + 8 - st_log.hits.nfb + i) % 8;
+		con_skip();
+		con_text(st_log.hits.fb[idx]);
+	}
+	con_skip();
+	con_str("LOG", "Metal telemetry (last rows):");
+	{
+		unsigned tshow = st_log.hits.ntel < 18 ? st_log.hits.ntel : 18;
+		for (unsigned i = 0; i < tshow; i++) {
+			unsigned idx = (st_log.hits.postel + 56 - tshow + i) % 56;
+			con_skip();
+			con_text(log_tel_body(st_log.hits.tel[idx]));
+		}
+	}
+	con_skip();
 	con_str("LOG", "last SWEET TOUCH/FB/GPU, MTL2 lines:");
-	for (unsigned i = 0; i < st_log.hits.n; i++) {
+	for (unsigned i = 0; i < st_log.hits.n && i < 4; i++) {
 		unsigned idx = (st_log.hits.pos + SWEETLOG_HITS - st_log.hits.n + i) % SWEETLOG_HITS;
 		con_skip();
 		con_text(st_log.hits.line[idx]);

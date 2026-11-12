@@ -2770,7 +2770,7 @@ extern "C" size_t native_bridge_metal_benchmark(id device,const char *metallib,u
 extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  size_t at=0;out[0]=0;
  auto row=[&](const char *format,auto... args){
-  char text[200];int n=snprintf(text,sizeof text,format,args...);if(n<=0)return;if(n>90)n=90;
+  char text[200];int n=snprintf(text,sizeof text,format,args...);if(n<=0)return;if(n>180)n=180;
   if(at+(size_t)n+2>=size)return;memcpy(out+at,text,(size_t)n);at+=(size_t)n;out[at++]='\n';out[at]=0;};
  auto ms=[](uint64_t us){return (unsigned long long)(us/1000);};
  {std::lock_guard<std::mutex> lock(gBenchLock);for(unsigned r=0;r<4;r++)if(gBench[r][0])row("%.90s",gBench[r]);}
@@ -2818,6 +2818,37 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
    row("K%u t=%llu.%03llus rp%u dr%u kpx%llu cs%u bl%u ctc=%lluus",r.index,(unsigned long long)(r.committedUs/1000000),(unsigned long long)((r.committedUs/1000)%1000),
     r.work.passes,r.work.draws,(unsigned long long)(r.work.pixels>>10),r.work.dispatches,r.work.blits,(unsigned long long)r.callbackUs);
    if(k<4)row("E%u age=%lluus scheduled=%lldus",r.index,(unsigned long long)r.ageUs,(long long)r.scheduledUs);
+  }
+ }
+ return at;
+}
+
+// 0258: the counters condensed for the in-kernel console: rows of at most 54 characters, one per line, so the
+// 60-column screen dump fits a whole snapshot. Names: P/L/F pipeline-library-function creation, C commit-to-
+// complete, Ws/Wc/Wr waits (scheduled, completed, resource), V the runtime's VkPipeline makings, K commits.
+extern "C" size_t native_bridge_metal_short(char *out,size_t size) {
+ size_t at=0;if(out&&size)out[0]=0;
+ auto row=[&](const char *format,auto... args){
+  char text[120];int n=snprintf(text,sizeof text,format,args...);if(n<=0)return;if(n>54)n=54;
+  if(at+(size_t)n+2>=size)return;memcpy(out+at,text,(size_t)n);at+=(size_t)n;out[at++]='\n';out[at]=0;};
+ auto ms=[](uint64_t us){return (unsigned long long)(us/1000);};
+ auto one=[&](const char *name,const Timed &t){
+  row("%s n%llu mx%llu tot%llu",name,(unsigned long long)t.count.load(),ms(t.slowest.load()),ms(t.total.load()));};
+ one("P",gTimePipeline);one("L",gTimeLibrary);one("F",gTimeFunction);one("C",gTimeEncodeToCommit);
+ one("Ws",gTimeWaitScheduled);one("Wc",gTimeWaitCompleted);one("Wr",gTimeResourceWait);
+ uint64_t work[10]={};
+ if(gDevice&&nmb_device_work_stats(gDevice,work))
+  row("V n%llu mx%llu w%llu f%llu",(unsigned long long)work[0],ms(work[2]),ms(work[3]),(unsigned long long)work[4]);
+ {
+  std::lock_guard<std::mutex> lock(gCommitLock);
+  const uint32_t newest=(uint32_t)gCommits.load();
+  unsigned printed=0;
+  for(uint32_t k=0;k<20&&k<newest&&printed<10;k++){
+   const CommitRecord &r=gCommitRing[(newest-k)%32];
+   if(r.index!=newest-k)continue;
+   row("K%u t%llu ctc%llu age%llu rp%u dr%u",r.index,(unsigned long long)(r.committedUs/1000000),
+    (unsigned long long)ms(r.callbackUs),(unsigned long long)ms(r.ageUs),r.work.passes,r.work.draws);
+   printed++;
   }
  }
  return at;
