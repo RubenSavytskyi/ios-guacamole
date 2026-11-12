@@ -13,6 +13,7 @@
 #import <objc/runtime.h>
 #include <IOKit/IOKitLib.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <sys/stat.h>
@@ -176,8 +177,8 @@ static io_service_t wait_for_redwood_gpu(long patience, long *waited)
 	*waited = 0;
 	io_service_t gpu = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("RedwoodGPU"));
 	while (!gpu && *waited < patience) {
-		if (*waited == 0)
-			sm2_log("waiting up to %ld s for RedwoodGPU before first Metal open", patience);
+		if (*waited == 0 || *waited % 10 == 0)
+			sm2_log("waiting for RedwoodGPU: %ld s of %ld", *waited, patience);
 		sleep(1);
 		++*waited;
 		gpu = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("RedwoodGPU"));
@@ -216,19 +217,33 @@ static io_service_t wait_for_redwood_gpu(long patience, long *waited)
 		}
 		NSString *bundle = [[NSBundle bundleForClass:[SweetMTL2Device class]] bundlePath];
 		NSString *turnip = [bundle stringByAppendingPathComponent:@"libvulkan_freedreno.dylib"];
-		char cache[256];
+		/*
+		 * The shader cache needs a directory this process may create files in. /var/local is root 0755, so only root
+		 * daemons can mkdir there; a sandboxed app is refused (EACCES) even when the directory exists. TMPDIR is the
+		 * one directory every process owns, so try it first and keep /var/local for the daemons.
+		 */
+		char cache[256] = { 0 };
+		char cand[3][256];
+		int ncand = 0;
+		const char *prog = getprogname();
 		mkdir("/var/local/m2v-cache", 0777);
 		chmod("/var/local/m2v-cache", 0777);
-		snprintf(cache, sizeof(cache), "/var/local/m2v-cache/%s", getprogname());
-		mkdir(cache, 0777);
-		if (access(cache, W_OK) != 0) {
-			/* a sandboxed process: its own caches directory */
-			char dir[256];
-			if (confstr(_CS_DARWIN_USER_CACHE_DIR, dir, sizeof(dir) - 8)) {
-				snprintf(cache, sizeof(cache), "%sm2v", dir);
-				mkdir(cache, 0700);
-			}
+		const char *tmp = getenv("TMPDIR");
+		if (tmp && tmp[0] == '/')
+			snprintf(cand[ncand++], sizeof(cand[0]), "%sm2v-%s", tmp + (tmp[strlen(tmp) - 1] == '/'), prog);
+		snprintf(cand[ncand++], sizeof(cand[0]), "/var/local/m2v-cache/%s", prog);
+		char dir[256];
+		if (confstr(_CS_DARWIN_USER_CACHE_DIR, dir, sizeof(dir) - 8))
+			snprintf(cand[ncand++], sizeof(cand[0]), "%sm2v-%s", dir, prog);
+		for (int i = 0; i < ncand && !cache[0]; i++) {
+			mkdir(cand[i], 0777);
+			if (access(cand[i], R_OK | W_OK | X_OK) == 0)
+				snprintf(cache, sizeof(cache), "%s", cand[i]);
+			else
+				sm2_log("cache candidate %s: %s", cand[i], strerror(errno));
 		}
+		if (!cache[0])
+			snprintf(cache, sizeof(cache), "%s", cand[0]);
 		/* plain rows everywhere: no Apple framebuffer compression, no 10-bit deep framebuffer */
 		setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
 		CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
@@ -288,7 +303,12 @@ static io_service_t wait_for_redwood_gpu(long patience, long *waited)
 		/* image bases, for symbolicating pstack samples (atos -o out/SweetMetal2.dSYM -l BASE ADDR) */
 		Dl_info self = { 0 }, tu = { 0 };
 		dladdr((void *)sm2_logs, &self);
-		void *th = dlopen(turnip.UTF8String, RTLD_NOW | RTLD_NOLOAD);
+		/* load it here first: a failure is named here instead of surfacing as a bridge "device" error */
+		void *th = dlopen(turnip.UTF8String, RTLD_NOW);
+		if (!th) {
+			const char *why = dlerror();
+			sm2_log("libvulkan_freedreno %s: %s", turnip.UTF8String, why ? why : "does not load");
+		}
 		void *vk = th ? dlsym(th, "vk_icdGetInstanceProcAddr") : NULL;
 		if (vk)
 			dladdr(vk, &tu);

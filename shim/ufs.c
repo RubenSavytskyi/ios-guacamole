@@ -273,7 +273,7 @@ void test_ufs(void)
  */
 #define SWEETLOG_RING_MAX	(4u << 20)
 #define SWEETLOG_BLOCKS		(1u + SWEETLOG_RING_MAX / BLOCK)
-#define SWEETLOG_HITS		32
+#define SWEETLOG_HITS		10
 #define SWEETLOG_LINE		112
 
 static uint32_t le32(const uint8_t *p)
@@ -298,15 +298,41 @@ static int has_word(const char *s, const char *w)
 struct log_hits {
 	char line[SWEETLOG_HITS][SWEETLOG_LINE];
 	unsigned n, pos;
+	char seen[6][SWEETLOG_LINE];	/* first GPU/Metal init lines: they scroll away early */
+	unsigned nseen;
+	char gpu[12][SWEETLOG_LINE];	/* first GPU bring-up lines, even if the ring starts late */
+	unsigned ngpu;
 };
 
-static void log_hit(struct log_hits *h, const char *line, unsigned len)
+static void log_copy(char *d, const char *line, unsigned len)
 {
-	char *d = h->line[h->pos];
 	unsigned k = len < SWEETLOG_LINE - 1 ? len : SWEETLOG_LINE - 1;
 	for (unsigned i = 0; i < k; i++)
 		d[i] = line[i];
 	d[k] = 0;
+}
+
+static int log_gpu_line(const char *s)
+{
+	return has_word(s, "SWEET GPU") || has_word(s, "RedwoodGPU") ||
+	       has_word(s, "Adreno") || has_word(s, "sweetgpu") ||
+	       has_word(s, "SweetAccelerator");
+}
+
+static int log_rare(const char *s)
+{
+	return has_word(s, "IOAccelerator") || log_gpu_line(s) ||
+	       has_word(s, "SweetMetal") || has_word(s, "MTL2") ||
+	       has_word(s, "Metal plugin") || has_word(s, "sweetmtl");
+}
+
+static void log_hit(struct log_hits *h, const char *line, unsigned len)
+{
+	if (log_gpu_line(line) && h->ngpu < 12)
+		log_copy(h->gpu[h->ngpu++], line, len);
+	if (log_rare(line) && h->nseen < 6)
+		log_copy(h->seen[h->nseen++], line, len);
+	log_copy(h->line[h->pos], line, len);
 	h->pos = (h->pos + 1) % SWEETLOG_HITS;
 	if (h->n < SWEETLOG_HITS)
 		h->n++;
@@ -360,14 +386,15 @@ static void log_line(struct log_state *p)
 {
 	if (!p->curlen)
 		return;
+	/* has_word() scans until a NUL: without this it read stale bytes past the line. */
+	p->cur[p->curlen < sizeof(p->cur) - 1 ? p->curlen : sizeof(p->cur) - 1] = 0;
 	/*
 	 * Keep the lines that matter for the graphics bring-up as well as touch:
 	 * the framebuffer driver's 5 s stats, the GPU stages and the Metal plugin.
 	 */
 	if (has_word(p->cur, "SWEET TOUCH") || has_word(p->cur, "SWEET RPMH") ||
 	    has_word(p->cur, "SWEET FB") || has_word(p->cur, "SWEET GPU") ||
-	    has_word(p->cur, "MTL2") || has_word(p->cur, "RedwoodGPU") ||
-	    has_word(p->cur, "SweetMetal") || has_word(p->cur, "IOAccelerator")) {
+	    log_rare(p->cur)) {
 		log_hit(&p->hits, p->cur, p->curlen);
 	} else {
 		char *d = p->tail[p->tpos];
@@ -488,6 +515,18 @@ sweet_log_dump(void)
 	}
 	log_line(&st_log);	/* final unterminated line */
 
+	con_str("LOG", "GPU bring-up lines (first seen):");
+	for (unsigned i = 0; i < st_log.hits.ngpu; i++) {
+		con_skip();
+		con_text(st_log.hits.gpu[i]);
+	}
+	con_skip();
+	con_str("LOG", "GPU / Metal init lines (first seen):");
+	for (unsigned i = 0; i < st_log.hits.nseen; i++) {
+		con_skip();
+		con_text(st_log.hits.seen[i]);
+	}
+	con_skip();
 	con_str("LOG", "last SWEET TOUCH/FB/GPU, MTL2 lines:");
 	for (unsigned i = 0; i < st_log.hits.n; i++) {
 		unsigned idx = (st_log.hits.pos + SWEETLOG_HITS - st_log.hits.n + i) % SWEETLOG_HITS;
