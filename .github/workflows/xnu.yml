@@ -34,11 +34,12 @@ env:
 
 jobs:
   build:
-    # GitHub retired the macos-14 image on 2026-11-02 (jobs are cancelled at
-    # queue time: "configuration 'macos-14-arm64-us-default' is not supported").
-    # macos-15 ships Xcode 16+, whose iig emits IORPC.kernelContent, so the
-    # local kernelContent patch is applied with the others.
-    runs-on: macos-15
+    # macos-14 was retired on 2026-11-02 (jobs are cancelled at queue time:
+    # "configuration 'macos-14-arm64-us-default' is not supported"). Plain
+    # macos-15 is arm64 and is capacity-constrained on public repos ("job was
+    # not acquired by Runner of type hosted"), so use the x86_64 image; it has
+    # Xcode 16.4 and cross-compiles the arm64 kernel.
+    runs-on: macos-15-intel
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
