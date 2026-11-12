@@ -1,0 +1,429 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 391594a..ea2ae7d 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -9,6 +9,11 @@
+  * the TLMM SOUTH tile; vdd_2v8 = pm8150_l17 at 3.008 V; panel 1440x3120.
+  * Protocol per Linux drivers/input/touchscreen/s6sy761.c. Only IC writes:
+  * TOUCH_FUNCTION=touch and SENSE_ON. No firmware upload, no PMIC writes.
++ *
++ * 0157: by default the two pads are driven as plain GPIO (bit-bang I2C,
++ * sweetbb=0 restores the SE path). This phone's boot chain leaves QUP SE17
++ * in GSI/DMA mode and SM8150 offers no AP-writable register to move it back
++ * to the FIFO sequencer, so the SE engine cannot send a single byte here.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -95,10 +100,14 @@ void sweet_touch_init(void);
+ static struct {
+ 	vm_offset_t se, gcc, gpio;
+ 	bool started, dead, probing;
++	bool bb, bb_hold;
+ 	int irq_hint;
+ 	unsigned clk_sel;
+ 	uint32_t irq_status, irq_last, active;
+ 	unsigned sent, got;
++	uint64_t bb_hz;
++	unsigned bb_half;
++	uint32_t bb_sda, bb_scl;
+ 	int x[TOUCH_MAX], y[TOUCH_MAX];
+ } st;
+ static int touch_sleep_chan;
+@@ -155,6 +164,218 @@ touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out,
+ 	touch_wr(st.gpio, off, cfg);
+ }
+ 
++/*
++ * Bit-bang I2C on the pads themselves (SDA GPIO55, SCL GPIO56), open-drain
++ * style: drive low by enabling the output with a 0 latch, release by putting
++ * the pad back into input mode (pull-up stays on). The QUP is not involved, so
++ * this works no matter which mode the boot chain left SE17 in.
++ *
++ * Timing comes from mach_absolute_time(); the tick rate is derived from XNU's
++ * own absolutetime_to_nanoseconds() conversion (no clock votes needed).
++ */
++static uint64_t
++touch_bb_ticks(void)
++{
++	return mach_absolute_time();
++}
++
++static uint64_t
++touch_bb_hz(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(1000000u, &ns);
++	if (!ns) {
++		return 19200000u;
++	}
++	return 1000000000000000ull / ns;
++}
++
++static void
++touch_bb_delay(uint64_t ticks)
++{
++	uint64_t start = touch_bb_ticks();
++	while (touch_bb_ticks() - start < ticks) {
++	}
++}
++
++static void
++touch_bb_put(unsigned pin, uint32_t cfg, bool low)
++{
++	if (low) {
++		uint32_t io = touch_rd(st.gpio, TOUCH_GPIO_IO(pin));
++		touch_wr(st.gpio, TOUCH_GPIO_IO(pin), io & ~2u);
++		touch_wr(st.gpio, TOUCH_GPIO_CFG(pin), cfg | 0x200u);
++	} else {
++		touch_wr(st.gpio, TOUCH_GPIO_CFG(pin), cfg & ~0x200u);
++	}
++}
++
++/* Release SCL; a slave that stretches the clock is waited for (2 ms max). */
++static bool
++touch_bb_scl_high(void)
++{
++	uint64_t limit = st.bb_hz / 500u;
++	uint64_t start;
++
++	touch_bb_put(TP_SCL, st.bb_scl, false);
++	start = touch_bb_ticks();
++	while (!(touch_rd(st.gpio, TOUCH_GPIO_IO(TP_SCL)) & 1u)) {
++		if (touch_bb_ticks() - start > limit) {
++			return false;
++		}
++	}
++	touch_bb_delay(st.bb_half);
++	return true;
++}
++
++static bool
++touch_bb_start(void)
++{
++	touch_bb_put(TP_SDA, st.bb_sda, false);
++	touch_bb_delay(st.bb_half);
++	if (!touch_bb_scl_high()) {
++		return false;
++	}
++	touch_bb_put(TP_SDA, st.bb_sda, true);
++	touch_bb_delay(st.bb_half);
++	touch_bb_put(TP_SCL, st.bb_scl, true);
++	touch_bb_delay(st.bb_half);
++	return true;
++}
++
++static void
++touch_bb_stop(void)
++{
++	touch_bb_put(TP_SDA, st.bb_sda, true);
++	touch_bb_delay(st.bb_half);
++	(void)touch_bb_scl_high();
++	touch_bb_put(TP_SDA, st.bb_sda, false);
++	touch_bb_delay(st.bb_half);
++}
++
++static bool
++touch_bb_bit(bool one)
++{
++	touch_bb_put(TP_SDA, st.bb_sda, !one);
++	touch_bb_delay(st.bb_half);
++	if (!touch_bb_scl_high()) {
++		return false;
++	}
++	touch_bb_put(TP_SCL, st.bb_scl, true);
++	touch_bb_delay(st.bb_half);
++	return true;
++}
++
++/* -1 on a stuck clock, else the level the slave put on SDA. */
++static int
++touch_bb_read_bit(void)
++{
++	int v;
++
++	touch_bb_put(TP_SDA, st.bb_sda, false);
++	touch_bb_delay(st.bb_half);
++	if (!touch_bb_scl_high()) {
++		return -1;
++	}
++	v = (int)(touch_rd(st.gpio, TOUCH_GPIO_IO(TP_SDA)) & 1u);
++	touch_bb_put(TP_SCL, st.bb_scl, true);
++	touch_bb_delay(st.bb_half);
++	return v;
++}
++
++static int
++touch_bb_write_byte(uint8_t b)
++{
++	int ack;
++
++	for (int i = 7; i >= 0; --i) {
++		if (!touch_bb_bit(((b >> i) & 1u) != 0)) {
++			return EIO;
++		}
++	}
++	ack = touch_bb_read_bit();
++	if (ack < 0) {
++		return EIO;
++	}
++	return ack == 0 ? 0 : ENXIO; /* 0 = ACK, 1 = NACK (nobody home) */
++}
++
++static int
++touch_bb_read_byte(uint8_t *out, bool last)
++{
++	uint8_t v = 0;
++
++	for (int i = 0; i < 8; ++i) {
++		int b = touch_bb_read_bit();
++		if (b < 0) {
++			return EIO;
++		}
++		v = (uint8_t)((v << 1) | (unsigned)b);
++	}
++	/* ACK every byte but the last (NACK = release SDA). */
++	if (!touch_bb_bit(last)) {
++		return EIO;
++	}
++	*out = v;
++	return 0;
++}
++
++/*
++ * One message. A stretched write (STOP_STRETCH) keeps SCL low and leaves the
++ * bus held; the following read picks it up with a repeated START, exactly like
++ * touch_read() expects.
++ */
++static int
++touch_bb_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
++    unsigned nr, bool stretch)
++{
++	bool restarted = st.bb_hold;
++	int err = 0;
++
++	st.bb_hold = false;
++	if (nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
++		return EIO;
++	}
++	if (!touch_bb_start()) {
++		return EIO;
++	}
++	if (!restarted) {
++		err = touch_bb_write_byte((uint8_t)(((unsigned)addr << 1) |
++		    (rx ? 1u : 0u)));
++		if (err) {
++			goto out;
++		}
++		for (unsigned i = 0; rx == NULL && i < nt; ++i) {
++			err = touch_bb_write_byte(tx[i]);
++			if (err) {
++				goto out;
++			}
++		}
++		if (!rx) {
++			if (stretch) {
++				st.bb_hold = true;
++				return 0;
++			}
++			goto out;
++		}
++	} else {
++		/* repeated START after the pointer write */
++		err = touch_bb_write_byte((uint8_t)(((unsigned)addr << 1) | 1u));
++		if (err) {
++			goto out;
++		}
++	}
++	for (unsigned i = 0; i < nr; ++i) {
++		err = touch_bb_read_byte(&rx[i], i + 1u == nr);
++		if (err) {
++			goto out;
++		}
++	}
++out:
++	touch_bb_stop();
++	return err;
++}
++
+ static bool
+ touch_clocks(void)
+ {
+@@ -333,14 +554,23 @@ static int
+ touch_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+     unsigned nr, bool stretch)
+ {
++	int err;
++
+ 	st.irq_status = st.irq_last = 0;
+ 	st.sent = st.got = 0;
+-	int err = touch_msg_run(addr, tx, nt, rx, nr, stretch);
++	err = st.bb ? touch_bb_msg(addr, tx, nt, rx, nr, stretch) :
++	    touch_msg_run(addr, tx, nt, rx, nr, stretch);
+ 	if (st.probing) {
+-		printf("SWEET TOUCH: probe xfer addr=%#x %s len=%u stretch=%u err=%d irq=%#x seen=%#x tx=%u rx=%u status=%#x\n",
+-		    addr, nr ? "read" : "write", nr ? nr : nt, stretch ? 1u : 0u,
+-		    err, st.irq_last, st.irq_status, st.sent, st.got,
+-		    touch_rd(st.se, SE_STATUS));
++		if (st.bb) {
++			printf("SWEET TOUCH: bb xfer addr=%#x %s len=%u stretch=%u err=%d\n",
++			    addr, nr ? "read" : "write", nr ? nr : nt,
++			    stretch ? 1u : 0u, err);
++		} else {
++			printf("SWEET TOUCH: probe xfer addr=%#x %s len=%u stretch=%u err=%d irq=%#x seen=%#x tx=%u rx=%u status=%#x\n",
++			    addr, nr ? "read" : "write", nr ? nr : nt,
++			    stretch ? 1u : 0u, err, st.irq_last, st.irq_status,
++			    st.sent, st.got, touch_rd(st.se, SE_STATUS));
++		}
+ 	}
+ 	return err;
+ }
+@@ -550,20 +780,30 @@ touch_thread(void *arg, wait_result_t result)
+ 	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
+ 	printf("SWEET TOUCH: starting in %u s\n", delay_s);
+ 	touch_wait(delay_s * 1000u);
+-	printf("SWEET TOUCH: mapping GCC/TLMM-south/SE (s6sy761 @%#x)\n", TP_ADDR);
+-	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
++	int bb = 1;
++	(void)PE_parse_boot_argn("sweetbb", &bb, sizeof(bb));
++	st.bb = bb != 0;
++	printf("SWEET TOUCH: mapping TLMM-south%s (s6sy761 @%#x)\n",
++	    st.bb ? ", bit-bang I2C" : "/GCC/SE", TP_ADDR);
+ 	st.gpio = ml_io_map(TOUCH_SOUTH_PA, TOUCH_GPIO_CFG(TP_IRQ + 1));
+-	st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
+-	if (!st.gcc || !st.gpio || !st.se) {
++	if (!st.gpio) {
+ 		printf("SWEET TOUCH: MMIO mapping failed\n");
+ 		goto out;
+ 	}
++	if (!st.bb) {
++		st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
++		st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
++		if (!st.gcc || !st.se) {
++			printf("SWEET TOUCH: MMIO mapping failed\n");
++			goto out;
++		}
++	}
+ 	printf("SWEET TOUCH: TLMM cfg/io rst=%#x/%#x irq=%#x/%#x 1v8=%#x/%#x sda=%#x scl=%#x\n",
+ 	    touch_rd(st.gpio, TOUCH_GPIO_CFG(TP_RST)), touch_rd(st.gpio, TOUCH_GPIO_IO(TP_RST)),
+ 	    touch_rd(st.gpio, TOUCH_GPIO_CFG(TP_IRQ)), touch_rd(st.gpio, TOUCH_GPIO_IO(TP_IRQ)),
+ 	    touch_rd(st.gpio, TOUCH_GPIO_CFG(TP_1V8)), touch_rd(st.gpio, TOUCH_GPIO_IO(TP_1V8)),
+ 	    touch_rd(st.gpio, TOUCH_GPIO_CFG(TP_SDA)), touch_rd(st.gpio, TOUCH_GPIO_CFG(TP_SCL)));
+-	if (!touch_clocks() || !touch_se_init()) {
++	if (!st.bb && (!touch_clocks() || !touch_se_init())) {
+ 		goto out;
+ 	}
+ 	/* Hold the IC in reset while the rails come up; IRQ stays an input. */
+@@ -576,29 +816,90 @@ touch_thread(void *arg, wait_result_t result)
+ 	}
+ 	touch_gpio(TP_1V8, 0, 3, 3, false, false);    /* DT tp_1v8 active: pull-up */
+ 	touch_wait(10);
+-	touch_gpio(TP_SDA, 1, 0, 0, false, false);    /* qup17, 2 mA, no bias */
+-	touch_gpio(TP_SCL, 1, 0, 0, false, false);
+-	touch_gpio(TP_RST, 0, 0, 3, true, true);      /* out of reset */
+-	touch_wait(300);                              /* Linux waits 140 ms */
+-	st.probing = true;
+-	uint8_t ev[SY_EVENT], bs = 0, id[3], panel[11], fw = 0;
+-	memset(ev, 0xa5, sizeof(ev));
+-	int e1 = touch_read(TP_ADDR, SY_READ_ONE, false, ev, SY_EVENT);
+-	if (!e1) {
+-		touch_hex("first event", ev, SY_EVENT);
+-	}
+-	int e2 = touch_read(TP_ADDR, SY_BOOT_STATUS, false, &bs, 1);
+-	int e3 = touch_read(TP_ADDR, SY_DEVICE_ID, false, id, sizeof(id));
+-	int e4 = touch_read(TP_ADDR, SY_PANEL_INFO, false, panel, sizeof(panel));
+-	int e5 = touch_read(TP_ADDR, SY_FW_INTEGRITY, false, &fw, 1);
+-	st.probing = false;
+-	printf("SWEET TOUCH: s6sy761 err=%d/%d/%d/%d/%d boot=%#x (app=0x20) devid=%02x%02x%02x fw=%#x (ok=0x80) irq-pin=%u\n",
+-	    e1, e2, e3, e4, e5, bs, id[0], id[1], id[2], fw,
+-	    touch_rd(st.gpio, TOUCH_GPIO_IO(TP_IRQ)) & 1u);
+-	if (!e4) {
+-		touch_hex("panel info", panel, sizeof(panel));
+-		printf("SWEET TOUCH: panel max x=%u y=%u tx=%u\n",
+-		    ((unsigned)panel[0] << 8) | panel[1], ((unsigned)panel[2] << 8) | panel[3], panel[8]);
++	if (st.bb) {
++		uint64_t hz = touch_bb_hz();
++		uint32_t khz = 100;
++
++		st.bb_hz = hz;
++		(void)PE_parse_boot_argn("sweetbbkhz", &khz, sizeof(khz));
++		if (khz < 10 || khz > 400) {
++			khz = 100;
++		}
++		st.bb_half = (unsigned)((hz / 1000u) / (khz * 2u));
++		if (st.bb_half < 2) {
++			st.bb_half = 2;
++		}
++		/* mux 0 = GPIO, pull-up, 6 mA, input = released */
++		touch_gpio(TP_SDA, 0, 3, 2, false, false);
++		touch_gpio(TP_SCL, 0, 3, 2, false, false);
++		st.bb_sda = touch_rd(st.gpio, TOUCH_GPIO_CFG(TP_SDA)) & ~0x200u;
++		st.bb_scl = touch_rd(st.gpio, TOUCH_GPIO_CFG(TP_SCL)) & ~0x200u;
++		printf("SWEET TOUCH: bit-bang %u kHz timebase=%llu half=%u ticks idle sda=%u scl=%u cfg=%#x/%#x\n",
++		    khz, (unsigned long long)hz, st.bb_half,
++		    touch_rd(st.gpio, TOUCH_GPIO_IO(TP_SDA)) & 1u,
++		    touch_rd(st.gpio, TOUCH_GPIO_IO(TP_SCL)) & 1u,
++		    st.bb_sda, st.bb_scl);
++	} else {
++		touch_gpio(TP_SDA, 1, 0, 0, false, false);    /* qup17, 2 mA, no bias */
++		touch_gpio(TP_SCL, 1, 0, 0, false, false);
++	}
++	uint8_t ev[SY_EVENT], bs = 0, id[3] = {0, 0, 0}, panel[11], fw = 0;
++	int e1 = EIO, e2 = EIO, e3 = EIO, e4 = EIO, e5 = EIO;
++	unsigned attempts = st.bb ? 3u : 1u;
++	for (unsigned a = 0; a < attempts; ++a) {
++		touch_gpio(TP_RST, 0, 0, 3, true, false); /* reset while the bus settles */
++		touch_wait(20);
++		touch_gpio(TP_RST, 0, 0, 3, true, true);  /* out of reset */
++		touch_wait(300);                          /* Linux waits 140 ms */
++		if (st.bb) {
++			/* Do the pads move, and is something holding the bus low? */
++			touch_gpio(TP_SDA, 0, 1, 2, false, false); /* pull-down */
++			touch_gpio(TP_SCL, 0, 1, 2, false, false);
++			touch_wait(1);
++			unsigned spd = touch_rd(st.gpio, TOUCH_GPIO_IO(TP_SDA)) & 1u;
++			unsigned cpd = touch_rd(st.gpio, TOUCH_GPIO_IO(TP_SCL)) & 1u;
++			touch_gpio(TP_SDA, 0, 3, 2, false, false); /* pull-up */
++			touch_gpio(TP_SCL, 0, 3, 2, false, false);
++			touch_wait(1);
++			printf("SWEET TOUCH: line test sda pd/pu=%u/%u scl pd/pu=%u/%u\n",
++			    spd, touch_rd(st.gpio, TOUCH_GPIO_IO(TP_SDA)) & 1u,
++			    cpd, touch_rd(st.gpio, TOUCH_GPIO_IO(TP_SCL)) & 1u);
++			/* Nine clocks release a slave stuck mid-byte. */
++			for (unsigned i = 0; i < 9; ++i) {
++				if (!touch_bb_bit(true)) {
++					break;
++				}
++			}
++			touch_bb_stop();
++			printf("SWEET TOUCH: idle sda=%u scl=%u\n",
++			    touch_rd(st.gpio, TOUCH_GPIO_IO(TP_SDA)) & 1u,
++			    touch_rd(st.gpio, TOUCH_GPIO_IO(TP_SCL)) & 1u);
++		}
++		st.probing = true;
++		memset(ev, 0xa5, sizeof(ev));
++		e1 = touch_read(TP_ADDR, SY_READ_ONE, false, ev, SY_EVENT);
++		e2 = touch_read(TP_ADDR, SY_BOOT_STATUS, false, &bs, 1);
++		e3 = touch_read(TP_ADDR, SY_DEVICE_ID, false, id, sizeof(id));
++		e4 = touch_read(TP_ADDR, SY_PANEL_INFO, false, panel, sizeof(panel));
++		e5 = touch_read(TP_ADDR, SY_FW_INTEGRITY, false, &fw, 1);
++		st.probing = false;
++		if (!e1) {
++			touch_hex("first event", ev, SY_EVENT);
++		}
++		printf("SWEET TOUCH: s6sy761 attempt=%u err=%d/%d/%d/%d/%d boot=%#x (app=0x20) devid=%02x%02x%02x fw=%#x (ok=0x80) irq-pin=%u\n",
++		    a + 1, e1, e2, e3, e4, e5, bs, id[0], id[1], id[2], fw,
++		    touch_rd(st.gpio, TOUCH_GPIO_IO(TP_IRQ)) & 1u);
++		if (!e4) {
++			touch_hex("panel info", panel, sizeof(panel));
++			printf("SWEET TOUCH: panel max x=%u y=%u tx=%u\n",
++			    ((unsigned)panel[0] << 8) | panel[1], ((unsigned)panel[2] << 8) | panel[3], panel[8]);
++		}
++		if (!e2 && bs == 0x20u) {
++			break;
++		}
++		if (a + 1 < attempts) {
++			printf("SWEET TOUCH: retrying after reset\n");
++		}
+ 	}
+ 	if (st.dead || e2 || bs != 0x20u) {
+ 		printf("SWEET TOUCH: S6SY761 not in application mode (dead=%d); stopping\n", st.dead);
