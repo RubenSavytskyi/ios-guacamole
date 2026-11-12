@@ -31,20 +31,24 @@ jobs:
 
       - name: Deps
         run: |
-          brew install bison flex glslang llvm rustup ninja
+          brew install bison flex glslang llvm ninja
           sudo mkdir -p /opt/homebrew/opt
-          for d in bison flex glslang llvm rustup; do
+          for d in bison flex glslang llvm; do
             sudo ln -sfn "/usr/local/opt/$d" "/opt/homebrew/opt/$d"
           done
-          rustup-init -y --default-toolchain 1.98.0 --profile minimal
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+            sh -s -- -y --default-toolchain 1.98.0 --profile minimal
+          . "$HOME/.cargo/env"
           rustup target add aarch64-apple-ios
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          sudo ln -sfn "$HOME/.cargo/bin" /opt/homebrew/opt/rustup-bin
           echo "/usr/local/opt/bison/bin" >> "$GITHUB_PATH"
           echo "/usr/local/opt/flex/bin" >> "$GITHUB_PATH"
           echo "DEVELOPER_DIR=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)/Contents/Developer" >> "$GITHUB_ENV"
           sw_vers
           xcodebuild -version
           cargo --version
+          rustc --version
 
       - name: Cache metal-work
         uses: actions/cache@v4
