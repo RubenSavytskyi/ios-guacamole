@@ -1,0 +1,124 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index ea2ae7d..a17295c 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -107,6 +107,7 @@ static struct {
+ 	unsigned sent, got;
+ 	uint64_t bb_hz;
+ 	unsigned bb_half;
++	unsigned bb_stuck;
+ 	uint32_t bb_sda, bb_scl;
+ 	int x[TOUCH_MAX], y[TOUCH_MAX];
+ } st;
+@@ -210,17 +211,23 @@ touch_bb_put(unsigned pin, uint32_t cfg, bool low)
+ 	}
+ }
+ 
+-/* Release SCL; a slave that stretches the clock is waited for (2 ms max). */
++/* Release SCL; a slave that stretches the clock is waited for (100 ms max). */
+ static bool
+ touch_bb_scl_high(void)
+ {
+-	uint64_t limit = st.bb_hz / 500u;
++	uint64_t limit = st.bb_hz / 10u;
+ 	uint64_t start;
+ 
+ 	touch_bb_put(TP_SCL, st.bb_scl, false);
+ 	start = touch_bb_ticks();
+ 	while (!(touch_rd(st.gpio, TOUCH_GPIO_IO(TP_SCL)) & 1u)) {
+ 		if (touch_bb_ticks() - start > limit) {
++			if (st.bb_stuck++ < 10) {
++				printf("SWEET TOUCH: bb scl stuck (%u) sda=%u cfg=%#x/%#x\n",
++				    st.bb_stuck,
++				    touch_rd(st.gpio, TOUCH_GPIO_IO(TP_SDA)) & 1u,
++				    st.bb_sda, st.bb_scl);
++			}
+ 			return false;
+ 		}
+ 	}
+@@ -845,6 +852,9 @@ touch_thread(void *arg, wait_result_t result)
+ 	}
+ 	uint8_t ev[SY_EVENT], bs = 0, id[3] = {0, 0, 0}, panel[11], fw = 0;
+ 	int e1 = EIO, e2 = EIO, e3 = EIO, e4 = EIO, e5 = EIO;
++	int w1 = EIO, w2 = EIO;
++	const uint8_t func[3] = {SY_TOUCH_FUNC, 0x01, 0x00}; /* SMBus word, LE */
++	const uint8_t on = SY_SENSE_ON;
+ 	unsigned attempts = st.bb ? 3u : 1u;
+ 	for (unsigned a = 0; a < attempts; ++a) {
+ 		touch_gpio(TP_RST, 0, 0, 3, true, false); /* reset while the bus settles */
+@@ -881,34 +891,55 @@ touch_thread(void *arg, wait_result_t result)
+ 		e2 = touch_read(TP_ADDR, SY_BOOT_STATUS, false, &bs, 1);
+ 		e3 = touch_read(TP_ADDR, SY_DEVICE_ID, false, id, sizeof(id));
+ 		e4 = touch_read(TP_ADDR, SY_PANEL_INFO, false, panel, sizeof(panel));
+-		e5 = touch_read(TP_ADDR, SY_FW_INTEGRITY, false, &fw, 1);
++		/*
++		 * Linux order (s6sy761_probe): reads, then the touch-function word write, then sense-on,
++		 * and the firmware-integrity read only at the end. Doing the 0x21 read first leaves the
++		 * bus in a state where the two writes time out.
++		 */
++		if (!e2 && bs == 0x20u) {
++			w1 = touch_write(func, sizeof(func));
++			w2 = touch_write(&on, 1);
++			e5 = touch_read(TP_ADDR, SY_FW_INTEGRITY, false, &fw, 1);
++		}
+ 		st.probing = false;
+ 		if (!e1) {
+ 			touch_hex("first event", ev, SY_EVENT);
+ 		}
+-		printf("SWEET TOUCH: s6sy761 attempt=%u err=%d/%d/%d/%d/%d boot=%#x (app=0x20) devid=%02x%02x%02x fw=%#x (ok=0x80) irq-pin=%u\n",
+-		    a + 1, e1, e2, e3, e4, e5, bs, id[0], id[1], id[2], fw,
++		printf("SWEET TOUCH: s6sy761 attempt=%u err=%d/%d/%d/%d/%d boot=%#x (app=0x20) devid=%02x%02x%02x fw=%#x (ok=0x80) func=%d sense=%d irq-pin=%u\n",
++		    a + 1, e1, e2, e3, e4, e5, bs, id[0], id[1], id[2], fw, w1, w2,
+ 		    touch_rd(st.gpio, TOUCH_GPIO_IO(TP_IRQ)) & 1u);
+ 		if (!e4) {
+ 			touch_hex("panel info", panel, sizeof(panel));
+ 			printf("SWEET TOUCH: panel max x=%u y=%u tx=%u\n",
+ 			    ((unsigned)panel[0] << 8) | panel[1], ((unsigned)panel[2] << 8) | panel[3], panel[8]);
+ 		}
+-		if (!e2 && bs == 0x20u) {
++		if (!e2 && bs == 0x20u && !w2) {
+ 			break;
+ 		}
+ 		if (a + 1 < attempts) {
+ 			printf("SWEET TOUCH: retrying after reset\n");
+ 		}
+ 	}
+-	if (st.dead || e2 || bs != 0x20u) {
+-		printf("SWEET TOUCH: S6SY761 not in application mode (dead=%d); stopping\n", st.dead);
++	if (st.dead || e2 || bs != 0x20u || w2) {
++		printf("SWEET TOUCH: S6SY761 not sensing (dead=%d func=%d sense=%d); stopping\n",
++		    st.dead, w1, w2);
+ 		goto out;
+ 	}
+-	const uint8_t func[3] = {SY_TOUCH_FUNC, 0x01, 0x00}; /* SMBus word, LE */
+-	const uint8_t on = SY_SENSE_ON;
+-	int w1 = touch_write(func, sizeof(func));
+-	int w2 = touch_write(&on, 1);
++	if (st.bb && e5) {
++		/*
++		 * The firmware-integrity read is best effort; if it gave up mid-byte
++		 * the slave may still be holding SDA, so free the bus before polling.
++		 */
++		for (unsigned i = 0; i < 9; ++i) {
++			if (!touch_bb_bit(true)) {
++				break;
++			}
++		}
++		touch_bb_stop();
++		printf("SWEET TOUCH: bus recovery after fw read err=%d idle sda=%u scl=%u\n",
++		    e5, touch_rd(st.gpio, TOUCH_GPIO_IO(TP_SDA)) & 1u,
++		    touch_rd(st.gpio, TOUCH_GPIO_IO(TP_SCL)) & 1u);
++	}
+ 	/*
+ 	 * 0152: every 4 ms (was 10): in a swipe CoreAnimation draws a frame when a touch sample has come, so
+ 	 * the sample rate is the swipe's frame rate (mtl2 run 13: 22-26 frames a second, every frame shown at
+@@ -921,9 +952,6 @@ touch_thread(void *arg, wait_result_t result)
+ 	}
+ 	printf("SWEET TOUCH: touch-function=%d sense-on=%d; polling %u ms, %ux%u irq-hint=%d\n",
+ 	    w1, w2, poll_ms, TP_W, TP_H, st.irq_hint);
+-	if (w2) {
+-		goto out;
+-	}
+ 	unsigned errors = 0, ticks = 0;
+ 	while (!st.dead) {
+ 		/* Optional IRQ hint (active low) still reads every ~100 ms and while down. */

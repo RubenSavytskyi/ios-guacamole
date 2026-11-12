@@ -1,12 +1,34 @@
 # Active handoff — iOS boots to the lock screen; only touch is left (2026-11-12, opencode)
 
-### >>> UPDATE 2026-11-12 (latest): CI through a fork + bit-bang driver 0157 <<<
+### >>> UPDATE 2026-11-12 (latest): 0157 bit-bang reached the IC; 0257 reorders the writes <<<
+
+- CI build `43198941064` (`61019f6`, `macos-15-intel`) succeeded in ~17 min →
+  `xnu/out-0157/kernel.development.sweet` (sha256 `356982d1…`); boot image
+  `shim/out/ios16-boot-bb10.img` (sha256 `1b229aa4…`, console visible, `sweettouchdelay=10`).
+- Boot result: **no hang**, reached the lock screen, touch dead. Ring via `logdump.img`:
+  `bit-bang 100 kHz timebase=19200000 half=96 ticks`, `line test sda pd/pu=1/1 scl pd/pu=1/1`,
+  every read `bb xfer … err=0`, `first event: 09 00 10 00 00 00 00 00`, `boot=0x20`, `devid=ac3761`,
+  panel `max x=1440 y=3120 tx=17`. So the IC does answer on GPIO55/56 and the QUP is fully bypassed.
+  Failure: `s6sy761 attempt=1 err=0/0/0/0/5` — the `0x21` (firmware integrity) read aborted and the
+  poisoned bus then made `touch-function=5` / `sense-on=5` fail, so sensing was never enabled.
+- **Patch 0257** (`xnu/patches/0257-guacamole-touch-sense-order.patch`, generated the same way from the
+  recon tree, so 0157 stays untouched): clock-stretch limit 2 ms → **100 ms** plus a
+  `bb scl stuck (%u) sda=… cfg=…/…` diagnostic (a firmware-integrity read can hold SCL far longer than
+  2 ms; aborting mid-byte is what poisoned the bus); Linux order restored — reads →
+  `TOUCH_FUNCTION` word write → `SENSE_ON` → `FIRMWARE_INTEGRITY` read last (best effort); the two
+  writes moved inside the 3-attempt retry loop and it only succeeds when `sense-on` returns 0; after a
+  failed `0x21` read a 9-clock bus recovery runs before polling. Attempt line now prints
+  `func=%d sense=%d`.
+
+### CI through a fork + the 0157 bit-bang driver
 
 - CI unlocked without a local macOS: fork **`RubenSavytskyi/ios-guacamole`** (public, Actions enabled via
   API), branch `guacamole-touch` force-pushed to the fork's `main` and set as its default branch.
   GitHub retired `macos-14` on 2026-11-02 (jobs are cancelled at queue time with
   `The configuration 'macos-14-arm64-us-default' is not supported`, 0 steps, conclusion `cancelled`),
-  so the workflow is now `runs-on: macos-15` and also copies `xnu/local/*.patch` into `dxb/patches/`
+  so the workflow is now `runs-on: macos-15-intel` (plain `macos-15` is arm64 and never acquired a
+  runner: `The job was not acquired by Runner of type hosted`, run `43196064388`) and also copies
+  `xnu/local/*.patch` into `dxb/patches/`
   (`0001-iorpc-kernelcontent.patch`: Xcode 16+ `iig` emits `IORPC.kernelContent`).
   Push with Windows git (Credential Manager, account `RubenSavytskyi`):
   `git -C "<repo>" push https://github.com/RubenSavytskyi/ios-guacamole.git guacamole-touch` and
