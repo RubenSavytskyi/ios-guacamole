@@ -20,8 +20,7 @@ build redwood-gpu-test gputest/redwood-gpu-test.c -framework IOKit -framework Co
 build sweet-bbd bbd/sweet-bbd.c
 build libsweet-bbd.dylib bbd/bbd-insert.c -dynamiclib -install_name /usr/lib/libsweet-bbd.dylib -framework IOSurface -Wl,-not_for_dyld_shared_cache \
 	-framework IOKit -framework CoreFoundation
-build libsweet-insert-test.dylib dyldtest/insert-test.c -dynamiclib -install_name /private/var/tmp/libsweet-insert-test.dylib
-# removable system apps: runs SystemAppMigrator; signed again with the entitlements it needs
+build libsweet-insert-test.dylib dyldtest/insert-test.c -dynamiclib -install_name /private/var/tmp/libsweet-insert-test.dylib# removable system apps: runs SystemAppMigrator; signed again with the entitlements it needs
 build sweet-sysapps sysapps/sweet-sysapps.m -fobjc-arc -framework Foundation
 codesign -f -s - --entitlements sysapps/entitlements.plist out/sweet-sysapps
 build sweet-fs fsutil/sweet-fs.c -framework CoreFoundation
@@ -68,19 +67,6 @@ build bluetoold bt/bluetoold.c -framework CoreFoundation
 # /var/local/bin/adspd and /var/local/bin/tfa (job com.sweet.adspd, script /var/local/adspd.boot)
 build adspd adsp/adspd.c adsp/edge.c wland/pmem.c wland/smem.c wland/qmi.c -Iwland -Iadsp
 build tfa adsp/tfa.c wland/pmem.c -Iwland
-# SweetCodec: a HAL AudioServerPlugIn (Codec + Hawking) writing the ADSP's ring /var/local/pcm.ring;
-# install as /Library/Audio/Plug-Ins/HAL/SweetCodec.driver/{SweetCodec,Info.plist}
-# The iOS SDK has no AudioServerPlugIn.h (a macOS SDK header); borrow it, link only CoreFoundation
-mkdir -p out/SweetCodec.driver
-MACSDK=$(xcrun --sdk macosx --show-sdk-path)
-INC=out/hal-include
-mkdir -p $INC/CoreAudio $INC/CoreAudioTypes
-cp "$MACSDK/System/Library/Frameworks/CoreAudio.framework/Headers/"*.h $INC/CoreAudio/ 2>/dev/null || true
-cp "$MACSDK/System/Library/Frameworks/CoreAudioTypes.framework/Headers/"*.h $INC/CoreAudioTypes/ 2>/dev/null || true
-$CC -I$INC -o out/SweetCodec.driver/SweetCodec -bundle audio/sweetcodec.c -framework CoreFoundation
-codesign -f -s - out/SweetCodec.driver/SweetCodec
-cp audio/Info.plist out/SweetCodec.driver/Info.plist
-echo out/SweetCodec.driver
 # A2DP: what the kernel answers to bluetoothd's user-pipe Skywalk nexus (research/bluetooth/a2dp-skywalk.md)
 build nxprobe bt/nxprobe.c
 # nxprobe-bt: the same, signed with bluetoothd's entitlements (bt/bluetoothd-ents.plist, dumped from the iOS root
@@ -128,4 +114,23 @@ if [ -f $MESA/out/libOSMesa.8.dylib ]; then
 		-framework OpenGLES -framework OpenAL -Wl,-U,_sweet_gl_current_table -Wno-deprecated-declarations
 else
 	echo "skipped osmesa-triangle: run userland/mesa/mk-mesa.sh"
+fi
+
+# SweetCodec: a HAL AudioServerPlugIn (Codec + Hawking) writing the ADSP's ring /var/local/pcm.ring;
+# install as /Library/Audio/Plug-Ins/HAL/SweetCodec.driver/{SweetCodec,Info.plist}. The iOS SDK has no
+# AudioServerPlugIn.h (a macOS SDK header), so borrow the headers; the plug-in links only CoreFoundation.
+# Optional: a failure here must not stop the daemons (they are built above).
+if mkdir -p out/SweetCodec.driver && MACSDK=$(xcrun --sdk macosx --show-sdk-path) && \
+   mkdir -p out/hal-include/CoreAudio out/hal-include/CoreAudioTypes && \
+   cp "$MACSDK"/System/Library/Frameworks/CoreAudio.framework/Headers/*.h out/hal-include/CoreAudio/ 2>/dev/null; then
+	cp "$MACSDK"/System/Library/Frameworks/CoreAudioTypes.framework/Headers/*.h out/hal-include/CoreAudioTypes/ 2>/dev/null || true
+	if $CC -Iout/hal-include -o out/SweetCodec.driver/SweetCodec -bundle audio/sweetcodec.c -framework CoreFoundation; then
+		codesign -f -s - out/SweetCodec.driver/SweetCodec
+		cp audio/Info.plist out/SweetCodec.driver/Info.plist
+		echo out/SweetCodec.driver
+	else
+		echo "skipped SweetCodec: does not compile"
+	fi
+else
+	echo "skipped SweetCodec: no macOS SDK headers"
 fi
