@@ -70,8 +70,14 @@ build adspd adsp/adspd.c adsp/edge.c wland/pmem.c wland/smem.c wland/qmi.c -Iwla
 build tfa adsp/tfa.c wland/pmem.c -Iwland
 # SweetCodec: a HAL AudioServerPlugIn (Codec + Hawking) writing the ADSP's ring /var/local/pcm.ring;
 # install as /Library/Audio/Plug-Ins/HAL/SweetCodec.driver/{SweetCodec,Info.plist}
+# The iOS SDK has no AudioServerPlugIn.h (a macOS SDK header); borrow it, link only CoreFoundation
 mkdir -p out/SweetCodec.driver
-$CC -o out/SweetCodec.driver/SweetCodec -bundle audio/sweetcodec.c -framework CoreAudio -framework CoreFoundation
+MACSDK=$(xcrun --sdk macosx --show-sdk-path)
+INC=out/hal-include
+mkdir -p $INC/CoreAudio $INC/CoreAudioTypes
+cp "$MACSDK/System/Library/Frameworks/CoreAudio.framework/Headers/"*.h $INC/CoreAudio/ 2>/dev/null || true
+cp "$MACSDK/System/Library/Frameworks/CoreAudioTypes.framework/Headers/"*.h $INC/CoreAudioTypes/ 2>/dev/null || true
+$CC -I$INC -o out/SweetCodec.driver/SweetCodec -bundle audio/sweetcodec.c -framework CoreFoundation
 codesign -f -s - out/SweetCodec.driver/SweetCodec
 cp audio/Info.plist out/SweetCodec.driver/Info.plist
 echo out/SweetCodec.driver
