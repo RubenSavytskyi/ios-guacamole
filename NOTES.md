@@ -67,9 +67,22 @@
   `GPU users (work commits)`: SpringBoard **1**, chronod 3, PridePosterExtension 3 — CoreAnimation is
   drawing the whole UI on the CPU; only the poster extensions use Metal.
 - **Fix in flight: `xnu/patches/0258-guacamole-gpu-published-before-userspace.patch`** — `sweet_ufs_init()`
-  waits (≤20 s, `IOSleep`, only when `sweetgpu>=10`) for `redwood_gpu_ready()` before returning, so
-  `RedwoodGPU` is in the registry before launchd starts anything and the window server's lookup cannot block.
-  Kernel-only, so it needs `fastboot boot` and no userdata reflash.
+  waits (≤30 s, only when `sweetgpu>=10`) for a flag that `RedwoodGPU::start()` sets right after
+  `registerService()`, i.e. the moment `RedwoodGPU` is in the IORegistry, so the window server's lookup
+  cannot block. It must key on *that* flag, not on `redwood_gpu_ready()`: `be_ready = true` is set at the
+  **start** of `gpu_backend_start()`, up to half a second before `RedwoodGPUStart()` registers the service.
+  `IOSleep` has to be declared locally (`extern void IOSleep(unsigned ms);`) — `kern/clock.h` does not
+  declare it and CI failed with `call to undeclared function 'IOSleep'`. Kernel-only, so it needs
+  `fastboot boot` and no userdata reflash. First CI attempt `43443894031` (99337b5) failed to compile for
+  exactly that reason; the fixed patch is `0302f6d`, CI run `43449269052`.
+- **Why the diagnosis is coherent:** the accelerator object the framework opens is `IOAcceleratorES`,
+  published by `AppleCLCD::start()` (0088/0144) long before userspace. Every process therefore gets an
+  accelerator port and enters the plugin; `IOServiceMatching("RedwoodGPU")` then matches on the class
+  name of the GPU service, which only stage 11 registers. So the window server's device creation reaches
+  `wait_for_redwood_gpu` with the service still missing, and its second `IOServiceGetMatchingService`
+  (1 s later) never returns. `sweetmtlwait=0` (image `2e8b71da…`) is **not** a fix: it would skip the wait
+  and attempt `nmb_device_open` at t≈1 s, when RedwoodGPU still does not exist (the reason the wait was
+  added), so it stays shelved as a diagnostic only.
 - Frame stats of that boot (software CoreAnimation, blur on): gaps `<17 ms` 170, `<34` 37, `<50` 3, `more` 0,
   `GPU busy 48%`, `SwapWait 419 (timed out 0)`. With blur off the user reports only a small gain — consistent
   with a CPU-bound render server, not with a fill-rate problem.
