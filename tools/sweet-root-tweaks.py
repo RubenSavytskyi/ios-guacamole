@@ -28,10 +28,14 @@ screen (image versions v8-v14 in NOTES.md):
                   /usr/libexec/sweet-bbd (userland/bbd), which execs the real
                   backboardd with our library in DYLD_INSERT_LIBRARIES;
                   guacamole: com.sweet.wland (Wi-Fi, /var/local/bin/wland up 0),
-                  com.sweet.btbridge (Bluetooth, retried until Wi-Fi is up)
-                  and com.sweet.sshd (the rootless Procursus bootstrap's sshd in
-                  /var/jb), both RunAtLoad, so Wi-Fi and SSH come up on every
-                  boot without a SWEETBOX autorun.sh
+                  com.sweet.btd (Bluetooth, userland/bt/btd.c; bluetoothd talks
+                  H4 to the kernel control com.sweet.bt and com.apple.BlueTool
+                  runs /var/local/bin/bluetoold), com.sweet.adspd (speaker
+                  audio: /var/local/bin/adspd serve, script
+                  /var/local/adspd.boot) and com.sweet.sshd (the rootless
+                  Procursus bootstrap's sshd in /var/jb), all RunAtLoad, so
+                  Wi-Fi, Bluetooth, sound and SSH come up on every boot
+                  without a SWEETBOX autorun.sh
   containers      /private/var/containers/{Bundle,Data/System,Shared/SystemGroup,Temp}
                   (on iOS they live on the data volume)
   migration       LastSystemVersion so DataMigration does not run for an hour
@@ -114,18 +118,31 @@ NET_JOBS = {
         'StandardOutPath': '/var/local/displayd.out',
         'StandardErrorPath': '/var/local/displayd.out',
     },
-    # Bluetooth (userland/bt/btbridge): needs wland's rails, so it may fail while Wi-Fi comes up; KeepAlive retries
-    # every 10 s. One instance only (it takes /var/run/btbridge.lock): to run it by hand with packet logging, first
-    # `launchctl bootout system/com.sweet.btbridge`.
-    '/System/Library/LaunchDaemons/com.sweet.btbridge.plist': {
-        'Label': 'com.sweet.btbridge',
-        'ProgramArguments': ['/var/local/bin/btbridge', '-q'],
+    # Bluetooth (userland/bt/btd.c, from OtVaL228/ios-sweet guacamole): btd powers the controller, loads its
+    # firmware from /var/local/fw/bt and serves it to bluetoothd through the kernel control com.sweet.bt (xnu
+    # 0162 equivalent, boot-arg sweetbt=1); it retries until wland has the rails up.
+    '/System/Library/LaunchDaemons/com.sweet.btd.plist': {
+        'Label': 'com.sweet.btd',
+        'ProgramArguments': ['/var/local/bin/btd', 'serve'],
         'RunAtLoad': True,
-        'KeepAlive': True,
-        'ThrottleInterval': 10,
         'POSIXSpawnType': 'Interactive',
-        'StandardOutPath': '/var/local/btbridge.out',
-        'StandardErrorPath': '/var/local/btbridge.out',
+        'StandardOutPath': '/var/local/btd.out',
+        'StandardErrorPath': '/var/local/btd.out',
+    },
+    # Speaker audio (userland/adsp): adspd boots the ADSP once per phone boot (a restart takes the modem and
+    # Wi-Fi down), after ADSPD_BOOT seconds, then runs /var/local/adspd.boot (smmu, afe on, tfa init, pcm on)
+    # and keeps serving. No KeepAlive, for that reason.
+    '/System/Library/LaunchDaemons/com.sweet.adspd.plist': {
+        'Label': 'com.sweet.adspd',
+        'ProgramArguments': ['/var/local/bin/adspd', 'serve'],
+        'EnvironmentVariables': {'ADSPD_BOOT': '30'},
+        # the default daemon limit (6 MB) jetsams adspd while it loads the 13 MB ADSP firmware; launchd does
+        # not apply this for our job (still 6 MB), adspd raises its own limit (memorystatus_control)
+        'JetsamProperties': {'JetsamMemoryLimit': 128},
+        'RunAtLoad': True,
+        'POSIXSpawnType': 'Interactive',
+        'StandardOutPath': '/var/local/adspd.out',
+        'StandardErrorPath': '/var/local/adspd.out',
     },
     '/System/Library/LaunchDaemons/com.sweet.sshd.plist': {
         'Label': 'com.sweet.sshd',
@@ -135,6 +152,13 @@ NET_JOBS = {
         'POSIXSpawnType': 'Interactive',
     },
 }
+
+# bluetoothd: H4 over its "POSIX" driver, which is a kernel control socket (PF_SYSTEM) by name, not a tty:
+# com.sweet.bt relays it to btd. The address comes from the ADT bluetooth node (tools/mkadt.py). BlueTool
+# (Broadcom/Apple chip scripts; nothing for our ProductHash) is replaced by userland/bt/bluetoold, which
+# answers bluetoothd's RunBuiltinScript requests ("boot", "init") with result 0.
+BLUETOOTHD_ENV = {'BT_HCI_TRANSPORT': 'H4:POSIX:com.sweet.bt'}
+BLUETOOL_STANDIN = ['/var/local/bin/bluetoold']
 
 BBD_WRAPPER = '/usr/libexec/sweet-bbd'
 REMOVED_JOBS = ('com.apple.CommCenter', 'com.apple.fairplayd.H2')
@@ -162,6 +186,11 @@ def launchd_plist(src, dst):
     if '--net' in sys.argv:
         for k, j in NET_JOBS.items():
             jobs[k] = dict(j)
+        for job in jobs.values():
+            if job.get('Label') == 'com.apple.bluetoothd':
+                job.setdefault('EnvironmentVariables', {}).update(BLUETOOTHD_ENV)
+            if job.get('Label') == 'com.apple.BlueTool':
+                job['ProgramArguments'] = list(BLUETOOL_STANDIN)
     bbd = BBD_WRAPPER
     if '--no-bbd' in sys.argv:
         # A root built from the IPSW has no userland yet: /usr/libexec/sweet-bbd and

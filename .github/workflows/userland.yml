@@ -1,0 +1,57 @@
+name: userland
+
+# Builds every ios-sweet userland helper from userland/build.sh on an iOS SDK:
+# the daemons (sweet-autorun, sweet-bbd, wland, btd, bluetoold, adspd, tfa,
+# sweet-displayd, wifisvc, ...), the dylibs (libsweet-bbd) and the HAL plug-ins
+# (SweetCodec.driver). The EAGL pieces (Mesa + libsweet-gl) need the Mesa
+# cross-build and live in the `gl` artifact instead (workflow gl.yml).
+#
+# The result is the `userland` artifact: a tar of userland/out.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "userland/**"
+      - ".github/workflows/userland.yml"
+
+concurrency:
+  group: userland-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Intel image: plain macos-15 is arm64 and is capacity-starved on public repos (see xnu.yml)
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          echo "DEVELOPER_DIR=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)/Contents/Developer" >> "$GITHUB_ENV"
+          sw_vers
+          xcodebuild -version
+
+      - name: Build
+        run: bash userland/build.sh 2>&1 | tee build.log
+
+      - name: Package
+        if: always()
+        run: |
+          mkdir -p dist
+          ls -la userland/out || true
+          tar --no-xattrs -czf dist/userland.tgz -C userland/out . || true
+          cp build.log dist/ 2>/dev/null || true
+          ls -la dist
+          tar -tzf dist/userland.tgz | head -50 || true
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: userland
+          path: dist/*
+          if-no-files-found: warn
+          retention-days: 30

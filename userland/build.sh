@@ -58,6 +58,23 @@ build btprobe bt/btprobe.c wland/pmem.c -Iwland
 build btuart bt/btuart.c wland/pmem.c -Iwland
 # Bluetooth part 2: bluetoothd / BlueTool <-> WCN3998 through a pty at /dev/cu.bluetooth: /var/local/bin/btbridge
 build btbridge bt/btbridge.c wland/pmem.c -Iwland -Ibt
+# Bluetooth (userland/bt/btd.c, from OtVaL228/ios-sweet guacamole): WCN3990 HCI over the kernel control
+# socket com.sweet.bt (xnu 0162, boot-arg sweetbt=1), firmware from /var/local/fw/bt; install
+# /var/local/bin/btd (job com.sweet.btd). bluetoothd gets BT_HCI_TRANSPORT=H4:POSIX:com.sweet.bt.
+build btd bt/btd.c wland/pmem.c -Iwland
+# bluetoothd's BlueTool stand-in: RunBuiltinScript ("boot", "init") -> result 0 (job com.apple.BlueTool)
+build bluetoold bt/bluetoold.c -framework CoreFoundation
+# Speaker audio (userland/adsp): ADSP PAS boot, APR/AFE/ASM, TFA9874 over /dev/pmem; install
+# /var/local/bin/adspd and /var/local/bin/tfa (job com.sweet.adspd, script /var/local/adspd.boot)
+build adspd adsp/adspd.c adsp/edge.c wland/pmem.c wland/smem.c -Iwland -Iadsp
+build tfa adsp/tfa.c wland/pmem.c -Iwland
+# SweetCodec: a HAL AudioServerPlugIn (Codec + Hawking) writing the ADSP's ring /var/local/pcm.ring;
+# install as /Library/Audio/Plug-Ins/HAL/SweetCodec.driver/{SweetCodec,Info.plist}
+mkdir -p out/SweetCodec.driver
+$CC -o out/SweetCodec.driver/SweetCodec -bundle audio/sweetcodec.c -framework CoreAudio -framework CoreFoundation
+codesign -f -s - out/SweetCodec.driver/SweetCodec
+cp audio/Info.plist out/SweetCodec.driver/Info.plist
+echo out/SweetCodec.driver
 # A2DP: what the kernel answers to bluetoothd's user-pipe Skywalk nexus (research/bluetooth/a2dp-skywalk.md)
 build nxprobe bt/nxprobe.c
 # nxprobe-bt: the same, signed with bluetoothd's entitlements (bt/bluetoothd-ents.plist, dumped from the iOS root
