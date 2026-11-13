@@ -1,0 +1,66 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2262,4 +2262,20 @@
+ 
+ static unsigned gpu_stage;
+ 
++/*
++ * 0259: how long the bring-up takes, in seconds since boot. The window server creates its Metal
++ * device in the first second of userspace, so RedwoodGPU has to be registered before that; these
++ * marks say whether waiting longer in sweet_ufs_init can work at all.
++ */
++static void
++gpu_time_mark(const char *what)
++{
++	uint64_t abstime = 0, ns = 0;
++
++	clock_get_uptime(&abstime);
++	absolutetime_to_nanoseconds(abstime, &ns);
++	printf("SWEET GPU: %s at %llu.%03llu s\n", what,
++	    ns / 1000000000ull, (ns % 1000000000ull) / 1000000ull);
++}
++
+ static void
+@@ -2278,4 +2293,6 @@
+ 	    gpu_stage >= 11) {
++		gpu_time_mark("stages 1-10 done");
+ 		gpu_backend_start();
++		gpu_time_mark("backend and RedwoodGPU published");
+ 		gpu_ddr_vote();
+ 	}
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -674,16 +674,27 @@ sweet_ufs_init(void)
+ 	{
+ 		extern bool redwood_gpu_published(void);	/* iokit/Kernel/arm/RedwoodGPU.cpp */
+ 		extern void IOSleep(unsigned milliseconds);	/* iokit/Kernel/IOLib.cpp */
+-		unsigned stage = 0, waited_ms = 0;
++		/*
++		 * 0259: the cap is two minutes (boot-arg sweetgpuwait, seconds: 0 waits forever) because
++		 * the dump of the 0258 boot said "NOT registered before userspace (30000 ms waited)": the
++		 * bring-up had not reached RedwoodGPUStart() yet. The line now also prints the uptime at
++		 * the end of the wait, so the dump says how long the GPU really takes.
++		 */
++		unsigned stage = 0, seconds = 120, waited_ms = 0;
++		uint64_t uptime = 0;
+ 		(void)PE_parse_boot_argn("sweetgpu", &stage, sizeof(stage));
++		(void)PE_parse_boot_argn("sweetgpuwait", &seconds, sizeof(seconds));
+ 		if (stage >= 10) {
+-			while (!redwood_gpu_published() && waited_ms < 30000) {
++			while (!redwood_gpu_published() && (seconds == 0 || waited_ms < seconds * 1000)) {
+ 				IOSleep(20);
+ 				waited_ms += 20;
+ 			}
+-			printf("SWEET GPU: RedwoodGPU %s before userspace (%u ms waited)\n",
+-			    redwood_gpu_published() ? "registered" : "NOT registered", waited_ms);
++			clock_get_uptime(&uptime);
++			absolutetime_to_nanoseconds(uptime, &uptime);
++			printf("SWEET GPU: RedwoodGPU %s before userspace (%u ms waited, boot %llu.%03llu s)\n",
++			    redwood_gpu_published() ? "registered" : "NOT registered", waited_ms,
++			    uptime / 1000000000ull, (uptime % 1000000000ull) / 1000000ull);
+ 		}
+ 	}
+ 	return 0;
+ }

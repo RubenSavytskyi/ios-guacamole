@@ -320,6 +320,12 @@ struct log_hits {
 	/* the kernel's own "IOK <proc>: ..." trace: which registry call a daemon made and what it got */
 	char iokt[6][SWEETLOG_LINE];
 	unsigned niokt, posiokt;
+	/* the wait's own line ("... before userspace ..."): the one number that says whether 0258 worked */
+	char wait2[2][SWEETLOG_LINE];
+	unsigned nwait2, poswait2;
+	/* the tail of the kernel's GPU bring-up: was RedwoodGPU registered before userspace? */
+	char kw[4][SWEETLOG_LINE];
+	unsigned nkw, poskw;
 	/* the newest "native-metal:" lines: per-frame bridge activity, whoever's drawing */
 	char nm[8][SWEETLOG_LINE];
 	unsigned nnm, posnm;
@@ -469,12 +475,25 @@ static void log_hit(struct log_hits *h, const char *line, unsigned len)
 		if (h->nbbd < 12)
 			h->nbbd++;
 	}
-	/* 0258: the kernel side of backboardd's IOKit lookups (boot-arg sweetiolog) */
-	if (has_word(line, "IOK ")) {
+	/* 0258: the kernel side of backboardd's IOKit lookups (boot-arg sweetiolog), its own lines only */
+	if (has_word(line, "IOK ") && has_word(line, "backboardd")) {
 		log_copy(h->iokt[h->posiokt], line, len);
 		h->posiokt = (h->posiokt + 1) % 6;
 		if (h->niokt < 6)
 			h->niokt++;
+	}
+	if (has_word(line, "before userspace")) {
+		log_copy(h->wait2[h->poswait2], line, len);
+		h->poswait2 = (h->poswait2 + 1) % 2;
+		if (h->nwait2 < 2)
+			h->nwait2++;
+	}
+	/* 0258: the tail of the GPU bring-up, where the publication line and the wait's own line are */
+	if (has_word(line, "SWEET GPU")) {
+		log_copy(h->kw[h->poskw], line, len);
+		h->poskw = (h->poskw + 1) % 4;
+		if (h->nkw < 4)
+			h->nkw++;
 	}
 	if (has_word(line, "native-metal")) {
 		log_copy(h->nm[h->posnm], line, len);
@@ -735,29 +754,42 @@ sweet_log_dump(void)
 		}
 	}
 	con_skip();
-	con_str("LOG", "backboardd registry trace (newest 2, tail):");
+	con_str("LOG", "kernel GPU wait (0258):");
+	for (unsigned i = 0; i < st_log.hits.nwait2; i++) {
+		unsigned idx = (st_log.hits.poswait2 + 2 - st_log.hits.nwait2 + i) % 2;
+		con_skip();
+		con_text(st_log.hits.wait2[idx]);
+	}
+	con_skip();
+	con_str("LOG", "backboardd registry trace (newest 3, tail):");
 	{
-		unsigned show = st_log.hits.niokt < 2 ? st_log.hits.niokt : 2;
+		unsigned show = st_log.hits.niokt < 3 ? st_log.hits.niokt : 3;
 		for (unsigned i = 0; i < show; i++) {
 			unsigned idx = (st_log.hits.posiokt + 6 - show + i) % 6;
 			const char *s = st_log.hits.iokt[idx];
 			unsigned n = 0;
 			while (s[n])
 				n++;
-			if (n > 170)
-				s += n - 170;	/* the matching dictionary is long; the result is at the end */
+			if (n > 115)
+				s += n - 115;	/* the matching dictionary is long; the result is at the end */
 			con_skip();
 			con_text(s);
 		}
 	}
 	con_skip();
-	con_str("LOG", "Metal telemetry (newest 4 rows):");
+	con_str("LOG", "kernel GPU lines (newest 3, tail):");
 	{
-		unsigned tshow = st_log.hits.ntel < 4 ? st_log.hits.ntel : 4;
-		for (unsigned i = 0; i < tshow; i++) {
-			unsigned idx = (st_log.hits.postel + 56 - tshow + i) % 56;
+		unsigned show = st_log.hits.nkw < 3 ? st_log.hits.nkw : 3;
+		for (unsigned i = 0; i < show; i++) {
+			unsigned idx = (st_log.hits.poskw + 4 - show + i) % 4;
+			const char *s = st_log.hits.kw[idx];
+			unsigned n = 0;
+			while (s[n])
+				n++;
+			if (n > 115)
+				s += n - 115;
 			con_skip();
-			con_text(log_tel_body(st_log.hits.tel[idx]));
+			con_text(s);
 		}
 	}
 	con_skip();
