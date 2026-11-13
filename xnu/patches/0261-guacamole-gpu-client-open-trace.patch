@@ -1,0 +1,47 @@
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -470,9 +470,12 @@
+ bool
+ RedwoodGPUUserClient::initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties)
+ {
++	IOLog("SWEET GPU: user client init (type %u)\n", type);
+ 	if (!IOUserClient::initWithTask(owningTask, securityID, type, properties)) {
++		IOLog("SWEET GPU: user client init refused\n");
+ 		return false;
+ 	}
++	IOLog("SWEET GPU: user client init done\n");
+ 	fTask = owningTask;
+ 	return true;
+ }
+@@ -480,9 +488,13 @@
+ bool
+ RedwoodGPUUserClient::start(IOService * provider)
+ {
++	IOLog("SWEET GPU: user client start: backend %s, provider %s\n",
++	    redwood_gpu_ready() ? "ready" : "NOT ready", provider ? "present" : "missing");
+ 	if (!redwood_gpu_ready() || !IOUserClient::start(provider)) {
++		IOLog("SWEET GPU: user client start refused\n");
+ 		return false;
+ 	}
+ 	fBuffers = IONewZero(struct gpu_buffer, GPU_BUFFERS);
++	IOLog("SWEET GPU: user client started (%s)\n", fBuffers ? "ok" : "no buffers");
+ 	return fBuffers != NULL;
+ }
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -4296,4 +4296,13 @@
+ 		res = service->newUserClient( owningTask, (void *) owningTask,
+ 		    connect_type, propertiesDict, &client );
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		{
++			char sname[32];
++			if (sweet_iolog(sname, sizeof(sname))) {
++				IOLog("IOK %s: open %s type %u begin\n", sname,
++				    service->getMetaClass()->getClassName(), connect_type);
++			}
++		}
++#endif
+ 
+ 		if (propertiesDict) {
