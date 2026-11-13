@@ -66,7 +66,7 @@ build btd bt/btd.c wland/pmem.c -Iwland
 build bluetoold bt/bluetoold.c -framework CoreFoundation
 # Speaker audio (userland/adsp): ADSP PAS boot, APR/AFE/ASM, TFA9874 over /dev/pmem; install
 # /var/local/bin/adspd and /var/local/bin/tfa (job com.sweet.adspd, script /var/local/adspd.boot)
-build adspd adsp/adspd.c adsp/edge.c wland/pmem.c wland/smem.c -Iwland -Iadsp
+build adspd adsp/adspd.c adsp/edge.c wland/pmem.c wland/smem.c wland/qmi.c -Iwland -Iadsp
 build tfa adsp/tfa.c wland/pmem.c -Iwland
 # SweetCodec: a HAL AudioServerPlugIn (Codec + Hawking) writing the ADSP's ring /var/local/pcm.ring;
 # install as /Library/Audio/Plug-Ins/HAL/SweetCodec.driver/{SweetCodec,Info.plist}
