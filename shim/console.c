@@ -117,6 +117,8 @@ static void wait_ms(unsigned ms)
 
 	__asm__ volatile("isb; mrs %0, cntfrq_el0" : "=r"(freq));
 	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(start));
+	if (freq == 0)
+		freq = 19200000;	/* XO: never hang the pager on an unset counter */
 	ticks = freq / 1000ull * ms;
 	do {
 		__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(now));
