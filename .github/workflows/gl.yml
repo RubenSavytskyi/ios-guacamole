@@ -1,0 +1,85 @@
+name: gl
+
+# Builds the pieces of the EAGL path from the guacamole branch: Mesa 25.0.7
+# (freedreno + OSMesa, cross-built for iOS), libsweet-gl (EAGLContext on it),
+# the backboardd wrapper and the prefs tool. The kernel side (0125-0132,
+# 0117 RedwoodGPU) is already in xnu/patches.
+#
+# The result is the `gl` artifact: libOSMesa.8.dylib, libsweet-gl.dylib,
+# libsweet-bbd.dylib, sweet-bbd, prefs.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "userland/mesa/**"
+      - "userland/gpu/**"
+      - "userland/bbd/**"
+      - "userland/jb/prefs.c"
+      - "userland/build-gl.sh"
+      - ".github/workflows/gl.yml"
+
+concurrency:
+  group: gl-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Intel image: plain macos-15 is arm64 and is capacity-starved on public
+    # repos (see xnu.yml). Homebrew lives in /usr/local here, while mk-mesa.sh
+    # names /opt/homebrew paths, so link them.
+    runs-on: macos-15-intel
+    timeout-minutes: 300
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deps
+        run: |
+          brew install bison ninja
+          sudo mkdir -p /opt/homebrew/opt
+          for d in bison; do
+            sudo ln -sfn "/usr/local/opt/$d" "/opt/homebrew/opt/$d"
+          done
+          echo "/usr/local/opt/bison/bin" >> "$GITHUB_PATH"
+          echo "DEVELOPER_DIR=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)/Contents/Developer" >> "$GITHUB_ENV"
+          sw_vers
+          xcodebuild -version
+          bison --version | head -1
+
+      - name: Cache Mesa sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            userland/mesa/build/mesa-25.0.7.tar.xz
+            userland/mesa/build/mesa-25.0.7
+            userland/mesa/build/venv
+          key: mesa-src-${{ hashFiles('userland/mesa/patches/**', 'userland/mesa/redwood-drm/**', 'userland/mesa/mk-mesa.sh') }}
+
+      - name: Mesa
+        run: bash userland/mesa/mk-mesa.sh
+
+      - name: libsweet-gl
+        run: bash userland/build-gl.sh
+
+      - name: Package
+        if: always()
+        run: |
+          mkdir -p dist
+          for f in sweet-bbd libsweet-bbd.dylib libsweet-gl.dylib libOSMesa.8.dylib prefs; do
+            [ -f "userland/out/$f" ] && cp "userland/out/$f" dist/ || echo "missing $f"
+          done
+          ls -la dist
+          file dist/* 2>/dev/null || true
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gl
+          path: dist/*
+          if-no-files-found: warn
+          retention-days: 30
