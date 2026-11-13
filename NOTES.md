@@ -57,6 +57,22 @@
   user sees is the kernel fb compositor, not CoreAnimation's render server, and backboardd hangs inside its
   wait/open. Next dump prints the kernel's own IOKit trace for backboardd (0049, `sweetiolog`, on by
   default) — last 8 `IOK …` lines — to see which registry call it stops on.
+- **Root cause confirmed 2026-11-13 (the reason everything feels like "Windows without a graphics driver"):**
+  a dump that keeps the plugin's own backboardd lines apart from the kernel's per-selector flood
+  (`shim/ufs.c`, `0259` counters: `bbd` ring, per-process `native-metal: work commit` histogram) shows
+  exactly **one** `MTL2[58 backboardd]: waiting for RedwoodGPU: 0 s of 120` line for the whole boot — no
+  `10 s`, no `ready`, so the process is **stuck inside `IOServiceGetMatchingService("RedwoodGPU")`**, not
+  crash-looping (a restart would log the line again). The GPU bring-up thread (`sweetgpu=11`) publishes
+  `RedwoodGPU` a few seconds into boot, i.e. *after* the window server's first device creation.
+  `GPU users (work commits)`: SpringBoard **1**, chronod 3, PridePosterExtension 3 — CoreAnimation is
+  drawing the whole UI on the CPU; only the poster extensions use Metal.
+- **Fix in flight: `xnu/patches/0258-guacamole-gpu-published-before-userspace.patch`** — `sweet_ufs_init()`
+  waits (≤20 s, `IOSleep`, only when `sweetgpu>=10`) for `redwood_gpu_ready()` before returning, so
+  `RedwoodGPU` is in the registry before launchd starts anything and the window server's lookup cannot block.
+  Kernel-only, so it needs `fastboot boot` and no userdata reflash.
+- Frame stats of that boot (software CoreAnimation, blur on): gaps `<17 ms` 170, `<34` 37, `<50` 3, `more` 0,
+  `GPU busy 48%`, `SwapWait 419 (timed out 0)`. With blur off the user reports only a small gain — consistent
+  with a CPU-bound render server, not with a fill-rate problem.
 - Still no live shell on the device: no TWRP (neither image boots now), `usbipd`/`cdc_ether` unfinished in
   `~/wslk`. Everything above came from `fastboot boot logdump-gpu.img` and the user reading the screen.
 

@@ -1,0 +1,28 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -666,4 +666,25 @@ sweet_ufs_init(void)
+ 	sweet_gpu_probe();	/* GUACAMOLE: boot-arg sweetgpu=N */
+ 	sweet_mailbox_probe();	/* GUACAMOLE: boot-arg sweetmailbox=1 */
++	/*
++	 * 0258: RedwoodGPU has to be published before userspace starts. The window server creates its Metal
++	 * device first of all, and while the service is not in the registry yet its lookup blocks: backboardd
++	 * stopped at "waiting for RedwoodGPU: 0 s of 120" for the whole boot, so CoreAnimation drew the whole
++	 * interface on the CPU (the user's "like Windows without a graphics driver"). The bring-up thread
++	 * (sweetgpu=11) publishes the service a few seconds in; wait for it here, at most 20 s, so that no
++	 * process can ever see it missing.
++	 */
++	{
++		extern bool redwood_gpu_ready(void);	/* bsd/dev/sweet_gpu.c */
++		unsigned stage = 0, waited_ms = 0;
++		(void)PE_parse_boot_argn("sweetgpu", &stage, sizeof(stage));
++		if (stage >= 10) {
++			while (!redwood_gpu_ready() && waited_ms < 20000) {
++				IOSleep(20);
++				waited_ms += 20;
++			}
++			printf("SWEET GPU: %s before userspace after %u ms\n",
++			    redwood_gpu_ready() ? "RedwoodGPU published" : "no RedwoodGPU", waited_ms);
++		}
++	}
+ 	return 0;
+ }

@@ -310,6 +310,19 @@ struct log_hits {
 	unsigned ntel, postel;
 	char iok[8][SWEETLOG_LINE];	/* last "IOK ..." registry trace lines: what a daemon looks for before it stops */
 	unsigned niok, posiok;
+	/*
+	 * The Metal plugin's own lines for backboardd ("MTL2[58 backboardd]: ..."). The generic ring above is flooded by
+	 * the kernel's per-selector trace ("SWEET FB: backboardd sel 5 ..."), which hid whether the window server ever got
+	 * a Metal device - the difference between GPU-composited CoreAnimation and its software fallback.
+	 */
+	char bbd[12][SWEETLOG_LINE];
+	unsigned nbbd, posbbd;
+	/* the newest "native-metal:" lines: per-frame bridge activity, whoever's drawing */
+	char nm[8][SWEETLOG_LINE];
+	unsigned nnm, posnm;
+	/* who renders: "native-metal: work commit" lines counted per process name */
+	char who[8][24];
+	unsigned whon[8], nwho;
 	unsigned refused, opened, noload, black;
 };
 
@@ -364,6 +377,48 @@ static int log_metal_result(const char *s)
 	       has_word(s, "libvulkan"));
 }
 
+/* 0259: count a "work commit" line against the process named in its "MTL2[<pid> <name>]" prefix */
+static void log_note_committer(struct log_hits *h, const char *s)
+{
+	const char *p = s;
+	while (*p && !(p[0] == 'M' && p[1] == 'T' && p[2] == 'L' && p[3] == '2'))
+		p++;
+	if (!*p)
+		return;
+	p += 4;
+	if (*p == '[')
+		p++;
+	while (*p >= '0' && *p <= '9')
+		p++;
+	if (*p == ' ')
+		p++;
+	char name[24];
+	unsigned n = 0;
+	while (*p && *p != ']' && *p != ':' && n < sizeof(name) - 1)
+		name[n++] = *p++;
+	name[n] = 0;
+	if (n == 0)
+		return;
+	for (unsigned i = 0; i < h->nwho; i++) {
+		const char *a = h->who[i];
+		const char *b = name;
+		while (*a && *a == *b) {
+			a++;
+			b++;
+		}
+		if (!*a && !*b) {
+			h->whon[i]++;
+			return;
+		}
+	}
+	if (h->nwho < 8) {
+		for (unsigned i = 0; i <= n; i++)
+			h->who[h->nwho][i] = name[i];
+		h->whon[h->nwho] = 1;
+		h->nwho++;
+	}
+}
+
 static void log_hit(struct log_hits *h, const char *line, unsigned len)
 {
 	if (log_gpu_line(line) && h->ngpu < 12)
@@ -397,12 +452,28 @@ static void log_hit(struct log_hits *h, const char *line, unsigned len)
 		if (h->ntel < 56)
 			h->ntel++;
 	}
-	/* 0049: the kernel's registry/matching trace ("IOK <name>: ..."), backboardd on by default */
-	if (has_word(line, "IOK ")) {
+	/* every line backboardd wrote, kernel trace or plugin: its last one shows where it stops */
+	if (has_word(line, "backboardd") && !has_word(line, "SWEET FB")) {
 		log_copy(h->iok[h->posiok], line, len);
 		h->posiok = (h->posiok + 1) % 8;
 		if (h->niok < 8)
 			h->niok++;
+	}
+	/* 0259: the Metal plugin's own backboardd lines, kept apart from the kernel's per-selector flood above */
+	if (has_word(line, "MTL2") && has_word(line, "backboardd")) {
+		log_copy(h->bbd[h->posbbd], line, len);
+		h->posbbd = (h->posbbd + 1) % 12;
+		if (h->nbbd < 12)
+			h->nbbd++;
+	}
+	if (has_word(line, "native-metal")) {
+		log_copy(h->nm[h->posnm], line, len);
+		h->posnm = (h->posnm + 1) % 8;
+		if (h->nnm < 8)
+			h->nnm++;
+	}
+	if (has_word(line, "work commit")) {
+		log_note_committer(h, line);
 	}
 	log_copy(h->line[h->pos], line, len);
 	h->pos = (h->pos + 1) % SWEETLOG_HITS;
@@ -587,11 +658,30 @@ sweet_log_dump(void)
 	}
 	log_line(&st_log);	/* final unterminated line */
 
-	con_str("LOG", "backboardd IOKit trace (last 6):");
-	for (unsigned i = 0; i < st_log.hits.niok && i < 6; i++) {
-		unsigned idx = (st_log.hits.posiok + 8 - st_log.hits.niok + i) % 8;
-		con_skip();
-		con_text(st_log.hits.iok[idx]);
+	con_str("LOG", "backboardd Metal plugin lines (newest 5):");
+	{
+		unsigned show = st_log.hits.nbbd < 5 ? st_log.hits.nbbd : 5;
+		for (unsigned i = 0; i < show; i++) {
+			unsigned idx = (st_log.hits.posbbd + 12 - show + i) % 12;
+			con_skip();
+			con_text(st_log.hits.bbd[idx]);
+		}
+	}
+	con_skip();
+	con_str("LOG", "GPU users (native-metal work commits):");
+	{
+		unsigned show = st_log.hits.nwho < 5 ? st_log.hits.nwho : 5;
+		for (unsigned i = 0; i < show; i++) {
+			char text[48], *p = text;
+			const char *a = st_log.hits.who[i];
+			while (*a)
+				*p++ = *a++;
+			*p++ = ' ';
+			p = log_dec(p, st_log.hits.whon[i]);
+			*p = 0;
+			con_skip();
+			con_text(text);
+		}
 	}
 	con_skip();
 	{
@@ -615,23 +705,29 @@ sweet_log_dump(void)
 		*p = 0;
 		con_str("LOG", text);
 	}
-	con_str("LOG", "Metal results (last 3):");
-	for (unsigned i = 0; i < st_log.hits.nres && i < 3; i++) {
-		unsigned idx = (st_log.hits.posres + 8 - st_log.hits.nres + i) % 8;
-		con_skip();
-		con_text(st_log.hits.res[idx]);
-	}
-	con_skip();
-	con_str("LOG", "framebuffer stats (last 3):");
-	for (unsigned i = 0; i < st_log.hits.nfb && i < 3; i++) {
-		unsigned idx = (st_log.hits.posfb + 8 - st_log.hits.nfb + i) % 8;
-		con_skip();
-		con_text(st_log.hits.fb[idx]);
-	}
-	con_skip();
-	con_str("LOG", "Metal telemetry (last rows):");
+	con_str("LOG", "Metal results (newest 2):");
 	{
-		unsigned tshow = st_log.hits.ntel < 18 ? st_log.hits.ntel : 18;
+		unsigned show = st_log.hits.nres < 2 ? st_log.hits.nres : 2;
+		for (unsigned i = 0; i < show; i++) {
+			unsigned idx = (st_log.hits.posres + 8 - show + i) % 8;
+			con_skip();
+			con_text(st_log.hits.res[idx]);
+		}
+	}
+	con_skip();
+	con_str("LOG", "framebuffer stats (newest 3):");
+	{
+		unsigned show = st_log.hits.nfb < 3 ? st_log.hits.nfb : 3;
+		for (unsigned i = 0; i < show; i++) {
+			unsigned idx = (st_log.hits.posfb + 8 - show + i) % 8;
+			con_skip();
+			con_text(st_log.hits.fb[idx]);
+		}
+	}
+	con_skip();
+	con_str("LOG", "Metal telemetry (newest rows):");
+	{
+		unsigned tshow = st_log.hits.ntel < 5 ? st_log.hits.ntel : 5;
 		for (unsigned i = 0; i < tshow; i++) {
 			unsigned idx = (st_log.hits.postel + 56 - tshow + i) % 56;
 			con_skip();
@@ -639,11 +735,14 @@ sweet_log_dump(void)
 		}
 	}
 	con_skip();
-	con_str("LOG", "last SWEET TOUCH/FB/GPU, MTL2 lines:");
-	for (unsigned i = 0; i < st_log.hits.n && i < 4; i++) {
-		unsigned idx = (st_log.hits.pos + SWEETLOG_HITS - st_log.hits.n + i) % SWEETLOG_HITS;
-		con_skip();
-		con_text(st_log.hits.line[idx]);
+	con_str("LOG", "newest native-metal lines:");
+	{
+		unsigned show = st_log.hits.nnm < 2 ? st_log.hits.nnm : 2;
+		for (unsigned i = 0; i < show; i++) {
+			unsigned idx = (st_log.hits.posnm + 8 - show + i) % 8;
+			con_skip();
+			con_text(st_log.hits.nm[idx]);
+		}
 	}
 	con_skip();
 	con_str("TAIL", "last console lines of that boot:");
