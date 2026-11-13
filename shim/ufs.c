@@ -308,6 +308,8 @@ struct log_hits {
 	unsigned nres, posres;
 	char tel[56][SWEETLOG_LINE];	/* last Metal telemetry rows ("tel ...", one row per line) */
 	unsigned ntel, postel;
+	char iok[8][SWEETLOG_LINE];	/* last "IOK ..." registry trace lines: what a daemon looks for before it stops */
+	unsigned niok, posiok;
 	unsigned refused, opened, noload, black;
 };
 
@@ -394,6 +396,13 @@ static void log_hit(struct log_hits *h, const char *line, unsigned len)
 		h->postel = (h->postel + 1) % 56;
 		if (h->ntel < 56)
 			h->ntel++;
+	}
+	/* 0049: the kernel's registry/matching trace ("IOK <name>: ..."), backboardd on by default */
+	if (has_word(line, "IOK ")) {
+		log_copy(h->iok[h->posiok], line, len);
+		h->posiok = (h->posiok + 1) % 8;
+		if (h->niok < 8)
+			h->niok++;
 	}
 	log_copy(h->line[h->pos], line, len);
 	h->pos = (h->pos + 1) % SWEETLOG_HITS;
@@ -578,16 +587,11 @@ sweet_log_dump(void)
 	}
 	log_line(&st_log);	/* final unterminated line */
 
-	con_str("LOG", "GPU bring-up lines (first seen):");
-	for (unsigned i = 0; i < 0 && i < st_log.hits.ngpu; i++) {
+	con_str("LOG", "backboardd IOKit trace (last 6):");
+	for (unsigned i = 0; i < st_log.hits.niok && i < 6; i++) {
+		unsigned idx = (st_log.hits.posiok + 8 - st_log.hits.niok + i) % 8;
 		con_skip();
-		con_text(st_log.hits.gpu[i]);
-	}
-	con_skip();
-	con_str("LOG", "GPU / Metal init lines (first seen):");
-	for (unsigned i = 0; i < 0 && i < st_log.hits.nseen; i++) {
-		con_skip();
-		con_text(st_log.hits.seen[i]);
+		con_text(st_log.hits.iok[idx]);
 	}
 	con_skip();
 	{

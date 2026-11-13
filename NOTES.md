@@ -42,7 +42,21 @@
   4. Then decide: pipeline-cache work, drawable wait, or the ~83 fps bursts' pacing.
 - Free experiments already ruled out by the user: a second identical swipe pass is **not** smoother (so it
   is not shader-compile warm-up), Reduce Transparency changes nothing (so it is not blur fill rate), and
-  the 4.6 s stall is not panel refresh.
+  the 4.6 s stall is not panel refresh. **Both "faster present" switches panic the kernel (red screen):
+  `sweetfbatswap=0` and `sweetfbsync=0`. Working configuration is `sweetfbatswap=1 sweetfbsync=1`.**
+- **After `75c0e1f` the numbers jumped** (same image `ios16-boot-gpu1-c90.img`): 206 swaps/5 s (**41.1/s**),
+  longest gap **72 ms** (was 4599), gaps `<17 ms` 82 / `<34` 76 / `<50` 29 / `more` 19, `GPU busy 81% of
+  vsyncs` (was 44%), `SwapWait 411 (timed out 1)`, `CPU-copied Metal frames 0`. So the 69 drawable reads
+  per frame were the multi-second stalls; what is left is a **~24 ms frame** with the GPU 81% busy.
+  60 Hz vs 90 Hz still identical to the user ("ні краплі не плавніше, все 1 в 1"), and the panel is not
+  the limiter.
+- **The bridge telemetry block prints nothing, and the reason is now clear:** the thread that streams it is
+  started only *after* a successful device open, and **backboardd never opens Metal** — its last line is
+  `MTL2[58 backboardd]: waiting for RedwoodGPU: 0 s of 120`, with neither `ready after` nor `absent after`
+  and no `device ... in N ms`. Every other client opens (`refused 0, opened 7-8`). So the composition the
+  user sees is the kernel fb compositor, not CoreAnimation's render server, and backboardd hangs inside its
+  wait/open. Next dump prints the kernel's own IOKit trace for backboardd (0049, `sweetiolog`, on by
+  default) — last 8 `IOK …` lines — to see which registry call it stops on.
 - Still no live shell on the device: no TWRP (neither image boots now), `usbipd`/`cdc_ether` unfinished in
   `~/wslk`. Everything above came from `fastboot boot logdump-gpu.img` and the user reading the screen.
 
