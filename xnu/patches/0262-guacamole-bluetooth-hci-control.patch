@@ -1,0 +1,228 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -121,6 +121,7 @@
+ bsd/dev/redwood_apple80211.c	standard
+ bsd/dev/flame_sta.c		standard
+ bsd/dev/flame_wlan.c		standard
++bsd/dev/sweet_btctl.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -961,6 +961,8 @@
+ 	sweet_pmem_init();       /* 0138: /dev/pmem with sweetpmem=1 (bsd/dev/sweet_pmem.c) */
+ 	extern void flame_wlan_init(void);
+ 	flame_wlan_init();       /* 0139: /dev/wlan, en0 + Apple80211 for wifid (bsd/dev/flame_wlan.c) */
++	extern void sweet_btctl_init(void);
++	sweet_btctl_init();      /* 0262: kernel control com.sweet.bt, bluetoothd <-> btd (sweetbt=1) */
+ #endif
+ 
+ 
+diff --git a/bsd/dev/sweet_btctl.c b/bsd/dev/sweet_btctl.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_btctl.c
+@@ -0,0 +1,200 @@
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * com.sweet.bt: the Bluetooth HCI transport between bluetoothd and the
++ * userland controller driver (guacamole, boot-arg sweetbt=1).
++ *
++ * bluetoothd's "POSIX" HCI driver (BT_HCI_TRANSPORT=H4:POSIX:<name>) is not a
++ * tty: it opens socket(PF_SYSTEM, SOCK_STREAM, SYSPROTO_CONTROL), looks <name>
++ * up with CTLIOCGINFO and connects, takes the line settings with
++ * getsockopt(TIOCGETA), sets them back raw with setsockopt(TIOCSETA) and then
++ * reads and writes the H4 byte stream (its default name is Apple's
++ * com.apple.uart.sk.bluetooth, a Skywalk UART). Our controller is driven by
++ * userland/bt btd (GENI UART, Qualcomm firmware download), so this control
++ * only relays: the client that sets option SWEET_BT_DEVICE is the controller
++ * side, every other client is a host; bytes from a host go to the controller
++ * side, bytes from the controller side go to every host. The termios a host
++ * sets is kept and handed back, nothing more (btd keeps the UART at 115200).
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/kern_control.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/termios.h>
++#include <sys/ttycom.h>
++#include <kern/locks.h>
++#include <pexpert/pexpert.h>
++
++#define SWEET_BT_NAME   "com.sweet.bt"
++#define SWEET_BT_DEVICE 0x5357          /* setsockopt: this end is the controller */
++#define SWEET_BT_ENDS   4
++
++void sweet_btctl_init(void);
++
++struct bt_end {
++	u_int32_t unit;
++	int used;
++	int device;
++};
++
++static kern_ctl_ref bt_ref;
++static LCK_GRP_DECLARE(bt_grp, "sweet_btctl");
++static LCK_MTX_DECLARE(bt_mtx, &bt_grp);
++static struct bt_end bt_ends[SWEET_BT_ENDS];
++static struct termios bt_tio;
++static unsigned long bt_drops;
++
++static errno_t
++bt_connect(kern_ctl_ref ref, struct sockaddr_ctl *sac, void **unitinfo)
++{
++	(void)ref;
++	errno_t err = ENOBUFS;
++	lck_mtx_lock(&bt_mtx);
++	for (int i = 0; i < SWEET_BT_ENDS; i++) {
++		if (!bt_ends[i].used) {
++			bt_ends[i] = (struct bt_end){ .unit = sac->sc_unit, .used = 1, .device = 0 };
++			*unitinfo = &bt_ends[i];
++			err = 0;
++			break;
++		}
++	}
++	lck_mtx_unlock(&bt_mtx);
++	printf("SWEET BT: unit %u connected%s\n", sac->sc_unit, err ? " (no free end)" : "");
++	return err;
++}
++
++static errno_t
++bt_disconnect(kern_ctl_ref ref, u_int32_t unit, void *unitinfo)
++{
++	(void)ref;
++	struct bt_end *e = unitinfo;
++	lck_mtx_lock(&bt_mtx);
++	int device = e ? e->device : 0;
++	if (e) {
++		e->used = 0;
++	}
++	lck_mtx_unlock(&bt_mtx);
++	printf("SWEET BT: unit %u (%s) disconnected, %lu chunks dropped so far\n", unit,
++	    device ? "controller" : "host", bt_drops);
++	return 0;
++}
++
++/*
++ * The peers are looked up under bt_mtx and fed after it is dropped: the
++ * enqueue takes the peer's socket lock, and a send may come with the sender's
++ * socket locked.
++ */
++static errno_t
++bt_send(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, mbuf_t m, int flags)
++{
++	(void)unit;
++	(void)flags;
++	struct bt_end *e = unitinfo;
++	u_int32_t peers[SWEET_BT_ENDS];
++	int n = 0;
++	lck_mtx_lock(&bt_mtx);
++	int from_device = e && e->device;
++	for (int i = 0; i < SWEET_BT_ENDS; i++) {
++		if (bt_ends[i].used && &bt_ends[i] != e && bt_ends[i].device != from_device) {
++			peers[n++] = bt_ends[i].unit;
++		}
++	}
++	lck_mtx_unlock(&bt_mtx);
++	for (int i = 0; i < n; i++) {
++		mbuf_t c = m;
++		if (i < n - 1 && mbuf_dup(m, MBUF_WAITOK, &c) != 0) {
++			bt_drops++;
++			continue;
++		}
++		if (ctl_enqueuembuf(ref, peers[i], c, 0) != 0) {
++			mbuf_freem(c);
++			bt_drops++;
++		}
++		if (i == n - 1) {
++			m = NULL;
++		}
++	}
++	if (m) {
++		mbuf_freem(m);
++		if (!n) {
++			bt_drops++;
++		}
++	}
++	return 0;
++}
++
++static errno_t
++bt_setopt(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, int opt, void *data, size_t len)
++{
++	(void)ref;
++	struct bt_end *e = unitinfo;
++	if (opt == SWEET_BT_DEVICE) {
++		lck_mtx_lock(&bt_mtx);
++		if (e) {
++			e->device = 1;
++		}
++		lck_mtx_unlock(&bt_mtx);
++		printf("SWEET BT: unit %u is the controller\n", unit);
++		return 0;
++	}
++	if ((opt == (int)TIOCSETA || opt == (int)TIOCSETAW || opt == (int)TIOCSETAF) && data &&
++	    len == sizeof(bt_tio)) {
++		lck_mtx_lock(&bt_mtx);
++		memcpy(&bt_tio, data, sizeof(bt_tio));
++		lck_mtx_unlock(&bt_mtx);
++		return 0;
++	}
++	printf("SWEET BT: unit %u setsockopt %#x (%zu bytes) taken as is\n", unit, opt, len);
++	return 0;
++}
++
++static errno_t
++bt_getopt(kern_ctl_ref ref, u_int32_t unit, void *unitinfo, int opt, void *data, size_t *len)
++{
++	(void)ref;
++	(void)unitinfo;
++	if (opt == (int)TIOCGETA) {
++		if (data) {
++			if (*len < sizeof(bt_tio)) {
++				return EINVAL;
++			}
++			lck_mtx_lock(&bt_mtx);
++			memcpy(data, &bt_tio, sizeof(bt_tio));
++			lck_mtx_unlock(&bt_mtx);
++		}
++		*len = sizeof(bt_tio);
++		return 0;
++	}
++	printf("SWEET BT: unit %u getsockopt %#x (%zu bytes): nothing\n", unit, opt, *len);
++	if (data && *len) {
++		bzero(data, *len);
++	}
++	return 0;
++}
++
++void
++sweet_btctl_init(void)
++{
++	int on = 0;
++	if (!PE_parse_boot_argn("sweetbt", &on, sizeof(on)) || !on) {
++		return;
++	}
++	/* what a raw 115200 8N1 line reads back as (cfmakeraw + cfsetspeed) */
++	bt_tio.c_cflag = CS8 | CREAD | CLOCAL;
++	bt_tio.c_ispeed = bt_tio.c_ospeed = 115200;
++
++	struct kern_ctl_reg reg;
++	bzero(&reg, sizeof(reg));
++	strlcpy(reg.ctl_name, SWEET_BT_NAME, sizeof(reg.ctl_name));
++	reg.ctl_flags = CTL_FLAG_REG_SOCK_STREAM;
++	reg.ctl_sendsize = 64 * 1024;
++	reg.ctl_recvsize = 64 * 1024;
++	reg.ctl_connect = bt_connect;
++	reg.ctl_disconnect = bt_disconnect;
++	reg.ctl_send = bt_send;
++	reg.ctl_setopt = bt_setopt;
++	reg.ctl_getopt = bt_getopt;
++	errno_t err = ctl_register(&reg, &bt_ref);
++	printf("SWEET BT: kernel control %s -> %d\n", SWEET_BT_NAME, err);
++}
++#endif
