@@ -1,27 +1,67 @@
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -96,3 +96,4 @@ extern "C" {
+ void RedwoodGPUStart(void);
+ void RedwoodGPUStop(void);
++bool redwood_gpu_published(void);	/* 0258: the service is in the registry */
+ }
+@@ -319,4 +320,13 @@
+ 
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
++/*
++ * 0258: set by RedwoodGPU::start() once registerService() has put "RedwoodGPU" in the IORegistry.
++ * sweet_ufs_init() waits for it (boot-arg sweetgpu>=10) before userspace starts: the window
++ * server creates its Metal device first of all and, while the service is still missing, its
++ * registry lookup does not return - backboardd then sits in "waiting for RedwoodGPU" and
++ * CoreAnimation draws the whole interface on the CPU. Cleared only by a reboot.
++ */
++static bool gRedwoodPublished;
++
+ class RedwoodGPU : public IOService
+@@ -336,8 +346,15 @@
+ 	setProperty(kIOUserClientClassKey, "RedwoodGPUUserClient");
+ 	setName("RedwoodGPU");
+ 	registerService();
++	gRedwoodPublished = true;
+ 	return true;
+ }
+ 
++bool
++redwood_gpu_published(void)
++{
++	return gRedwoodPublished;
++}
++
+ void
+ RedwoodGPUStart(void)
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -666,4 +666,25 @@ sweet_ufs_init(void)
+@@ -665,4 +665,26 @@ sweet_ufs_init(void)
  	sweet_gpu_probe();	/* GUACAMOLE: boot-arg sweetgpu=N */
  	sweet_mailbox_probe();	/* GUACAMOLE: boot-arg sweetmailbox=1 */
 +	/*
-+	 * 0258: RedwoodGPU has to be published before userspace starts. The window server creates its Metal
-+	 * device first of all, and while the service is not in the registry yet its lookup blocks: backboardd
-+	 * stopped at "waiting for RedwoodGPU: 0 s of 120" for the whole boot, so CoreAnimation drew the whole
-+	 * interface on the CPU (the user's "like Windows without a graphics driver"). The bring-up thread
-+	 * (sweetgpu=11) publishes the service a few seconds in; wait for it here, at most 20 s, so that no
-+	 * process can ever see it missing.
++	 * 0258: RedwoodGPU has to be in the registry before userspace starts. The window server
++	 * creates its Metal device first of all, and while the service is not there yet its lookup
++	 * does not return: backboardd stopped at "waiting for RedwoodGPU: 0 s of 120" for a whole
++	 * boot, so CoreAnimation drew the entire interface on the CPU ("Windows without a graphics
++	 * driver"). The bring-up thread (sweetgpu=11) registers the service a few seconds in; wait
++	 * for it here (at most 30 s) so no process can look it up before it exists.
 +	 */
 +	{
-+		extern bool redwood_gpu_ready(void);	/* bsd/dev/sweet_gpu.c */
++		extern bool redwood_gpu_published(void);	/* iokit/Kernel/arm/RedwoodGPU.cpp */
++		extern void IOSleep(unsigned milliseconds);	/* iokit/Kernel/IOLib.cpp */
 +		unsigned stage = 0, waited_ms = 0;
 +		(void)PE_parse_boot_argn("sweetgpu", &stage, sizeof(stage));
 +		if (stage >= 10) {
-+			while (!redwood_gpu_ready() && waited_ms < 20000) {
++			while (!redwood_gpu_published() && waited_ms < 30000) {
 +				IOSleep(20);
 +				waited_ms += 20;
 +			}
-+			printf("SWEET GPU: %s before userspace after %u ms\n",
-+			    redwood_gpu_ready() ? "RedwoodGPU published" : "no RedwoodGPU", waited_ms);
++			printf("SWEET GPU: RedwoodGPU %s before userspace (%u ms waited)\n",
++			    redwood_gpu_published() ? "registered" : "NOT registered", waited_ms);
 +		}
 +	}
  	return 0;

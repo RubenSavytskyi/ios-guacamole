@@ -317,6 +317,9 @@ struct log_hits {
 	 */
 	char bbd[12][SWEETLOG_LINE];
 	unsigned nbbd, posbbd;
+	/* the kernel's own "IOK <proc>: ..." trace: which registry call a daemon made and what it got */
+	char iokt[6][SWEETLOG_LINE];
+	unsigned niokt, posiokt;
 	/* the newest "native-metal:" lines: per-frame bridge activity, whoever's drawing */
 	char nm[8][SWEETLOG_LINE];
 	unsigned nnm, posnm;
@@ -465,6 +468,13 @@ static void log_hit(struct log_hits *h, const char *line, unsigned len)
 		h->posbbd = (h->posbbd + 1) % 12;
 		if (h->nbbd < 12)
 			h->nbbd++;
+	}
+	/* 0258: the kernel side of backboardd's IOKit lookups (boot-arg sweetiolog) */
+	if (has_word(line, "IOK ")) {
+		log_copy(h->iokt[h->posiokt], line, len);
+		h->posiokt = (h->posiokt + 1) % 6;
+		if (h->niokt < 6)
+			h->niokt++;
 	}
 	if (has_word(line, "native-metal")) {
 		log_copy(h->nm[h->posnm], line, len);
@@ -725,23 +735,29 @@ sweet_log_dump(void)
 		}
 	}
 	con_skip();
-	con_str("LOG", "Metal telemetry (newest rows):");
+	con_str("LOG", "backboardd registry trace (newest 2, tail):");
 	{
-		unsigned tshow = st_log.hits.ntel < 5 ? st_log.hits.ntel : 5;
+		unsigned show = st_log.hits.niokt < 2 ? st_log.hits.niokt : 2;
+		for (unsigned i = 0; i < show; i++) {
+			unsigned idx = (st_log.hits.posiokt + 6 - show + i) % 6;
+			const char *s = st_log.hits.iokt[idx];
+			unsigned n = 0;
+			while (s[n])
+				n++;
+			if (n > 170)
+				s += n - 170;	/* the matching dictionary is long; the result is at the end */
+			con_skip();
+			con_text(s);
+		}
+	}
+	con_skip();
+	con_str("LOG", "Metal telemetry (newest 4 rows):");
+	{
+		unsigned tshow = st_log.hits.ntel < 4 ? st_log.hits.ntel : 4;
 		for (unsigned i = 0; i < tshow; i++) {
 			unsigned idx = (st_log.hits.postel + 56 - tshow + i) % 56;
 			con_skip();
 			con_text(log_tel_body(st_log.hits.tel[idx]));
-		}
-	}
-	con_skip();
-	con_str("LOG", "newest native-metal lines:");
-	{
-		unsigned show = st_log.hits.nnm < 2 ? st_log.hits.nnm : 2;
-		for (unsigned i = 0; i < show; i++) {
-			unsigned idx = (st_log.hits.posnm + 8 - show + i) % 8;
-			con_skip();
-			con_text(st_log.hits.nm[idx]);
 		}
 	}
 	con_skip();
