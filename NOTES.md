@@ -1,4 +1,45 @@
-# Active handoff — graphics: backboardd finally opens Metal; lag is now the present path (2026-11-13, opencode)
+# Active handoff — parity with the working guacamole setup: Wi-Fi + Bluetooth + EAGL graphics + sound (2026-11-14, opencode)
+
+- **The goal changed with the user's last message:** the friend's phone has Wi-Fi, Bluetooth, graphics and sound;
+  ours has none of them working. He only has `OtVaL228/ios-sweet` branch `guacamole` (tip `b19da00`, no
+  prebuilt images, no root dump), so "install his setup" = build his userland from source and reproduce his root.
+- **What his tree had that ours did not:** `userland/adsp/` (`adspd.c`, `edge.c`, `tfa.c`, `adspd.boot`),
+  `userland/audio/sweetcodec.c` (+ `sweetpcm.h`, `Info.plist`), `userland/bt/btd.c` + `bluetoold.c`, and the
+  kernel control `com.sweet.bt` (his `0162`). Ours already had identical `userland/wland`, `bbd`, `gpu`, `mesa`.
+  All of the missing sources are now imported (commits `e9d956a`, `e07de3d`, `f013108`).
+- **Firmware is not a blocker any more.** Nothing comes from the friend: the ADSP/WLAN/rmtfs blobs are inside our
+  own pre-iOS Android dumps `guac-artifacts/backup/guac-backup/` (`modem_a.img` is the FAT `modem` partition):
+  `image/adsp.mdt` + `adsp.b00-b13` (14 MB), `modem.mdt` + `modem.b00-b31` (80 MB), `wlanmdsp.mbn`,
+  `bdwlan.b0e`, `adspr.jsn`/`adspua.jsn`, plus `modemst1/2`, `fsg`, `fsc` (rmtfs copies). Bluetooth firmware
+  (`crbtfw21.tlv`, `crnv21.bin`) came from linux-firmware. All of it is staged in WSL `/root/stage/fw/` and is
+  *not* in git (size, and it is device firmware).
+- **Builds now come from two workflows, not from the Metal2 artifact:**
+  - `gl.yml` run `43525116335` (success): artifact `gl` = `libOSMesa.8.dylib`, `libsweet-gl.dylib`,
+    `libsweet-bbd.dylib`, `sweet-bbd`, `prefs`, all verified arm64 Mach-O.
+  - `userland.yml` (new): builds everything in `userland/build.sh` on `macos-15-intel` and uploads `userland.tgz`.
+    It needed two fixes: `adspd` links `wland/qmi.c` (`e07de3d`), and `SweetCodec` compiles against the macOS
+    SDK's `CoreAudio/AudioServerPlugIn.h` (the iOS SDK has no such header) and is built last/optionally so a HAL
+    failure cannot stop `wland`/`btd`/`adspd`. Also fixed a line-merge in `build.sh` (`889bb82`).
+- **Kernel `0262`** = the friend's `0162` (`bsd/dev/sweet_btctl.c`, control `com.sweet.bt`, boot-arg `sweetbt=1`),
+  needed by `btd`; our own `0220` only has the `btbridge` pairing (`com.apple.uart.bluetooth` +
+  `com.sweet.bt.host`). CI run `43528664841` builds it.
+- **Root image being assembled** (`/root/iosroot2.raw`, from the *flashed* `ios16-root-gpu.simg`, so SweetMetal2 and
+  the working state stay): installs `/usr/libexec/sweet-bbd` + `sweet-autorun`, `/usr/lib/{libsweet-bbd,
+  libsweet-gl,libOSMesa.8}.dylib`, `/var/local/bin/*` (`wland btd bluetoold adspd tfa ...`), `/var/local/fw/*`,
+  `/var/local/adspd.boot`, `/Library/Audio/Plug-Ins/HAL/SweetCodec.driver`, then
+  `tools/sweet-root-tweaks.py /mnt/root2 --net` (wland/btd/adspd/sshd jobs, bluetoothd `BT_HCI_TRANSPORT=
+  H4:POSIX:com.sweet.bt`, `com.apple.BlueTool` -> `bluetoold`, backboardd -> `sweet-bbd`).
+- **Boot image for this stage:** `%TEMP%\opencode\build-eagl.sh` (out `xnu/out-43528664841`, name `eagl1`):
+  no `sweetmtl=2`, `sweetgl=1 sweetglwait=120 sweetaudio=0 sweetwifi=1 sweetbt=1`, keeps
+  `sweetgpu=11 sweetfbatswap=1 sweetfbsync=1 sweetfb_noconsole=1`.
+- **WSL gotcha that cost an hour:** the WSL distro shuts down between tool calls, so mounts in `/mnt/root2` vanish
+  (and `ls` then shows stale `ENODATA`). A background `wsl -d Ubuntu -u root bash -c "exec sleep 100000"` keeps the
+  instance (and the mounts) alive; do mount -> install -> unmount in one script anyway.
+- **Not done yet:** image not flashed (needs the user's explicit "так"), kernel 0262 not yet verified on device,
+  Wi-Fi credentials not set (`/var/local/wlan.conf` or iOS Settings), CA prefs deliberately left alone (they are a
+  Metal-path trick; on EAGL the friend's notes say CA then draws filters itself and blur became streaks).
+
+# Previous handoff — graphics: backboardd finally opens Metal; lag is now the present path (2026-11-13, opencode)
 
 - **`0259` fixed the CPU-compositing blocker.** Boot `shim/out/ios16-boot-gpu1-t.img` (sha256
   `7055b3ae…`, kernel from CI run `43459989745`) + the flashed root: the dump shows
