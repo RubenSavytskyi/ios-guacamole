@@ -339,6 +339,19 @@ struct log_hits {
 	/* who renders: "native-metal: work commit" lines counted per process name */
 	char who[8][24];
 	unsigned whon[8], nwho;
+	/*
+	 * 0144's own per-process line "SWEET MTL: <name> opened: GPU VA ... + N MB". The plugin's
+	 * "opening Metal" says only that it got that far; this one says the user client really came up
+	 * (or why it did not: "GPU not ready", "no GPU window").
+	 */
+	char mtl[12][SWEETLOG_LINE];
+	unsigned nmtl, posmtl, mtl_all;
+	/* the same for backboardd alone: its open is the earliest, so a "newest N" ring would drop it */
+	char mtlbbd[2][SWEETLOG_LINE];
+	unsigned nmtlbbd, posmtlbbd;
+	/* the kernel's user-client trace (0117/0261): init/start/refused for RedwoodGPU's client */
+	char uc[8][SWEETLOG_LINE];
+	unsigned nuc, posuc, uc_all;
 	unsigned refused, opened, noload, black;
 };
 
@@ -518,6 +531,28 @@ static void log_hit(struct log_hits *h, const char *line, unsigned len)
 	}
 	if (has_word(line, "work commit")) {
 		log_note_committer(h, line);
+	}
+	/* 0144: who the kernel gave a GPU window to, and whether the open failed */
+	if (has_word(line, "SWEET MTL")) {
+		log_copy(h->mtl[h->posmtl], line, len);
+		h->posmtl = (h->posmtl + 1) % 12;
+		if (h->nmtl < 12)
+			h->nmtl++;
+		h->mtl_all++;
+		if (has_word(line, "backboardd")) {
+			log_copy(h->mtlbbd[h->posmtlbbd], line, len);
+			h->posmtlbbd = (h->posmtlbbd + 1) % 2;
+			if (h->nmtlbbd < 2)
+				h->nmtlbbd++;
+		}
+	}
+	/* 0261: the RedwoodGPU user client's own init/start lines, when the kernel has that trace */
+	if (has_word(line, "user client")) {
+		log_copy(h->uc[h->posuc], line, len);
+		h->posuc = (h->posuc + 1) % 8;
+		if (h->nuc < 8)
+			h->nuc++;
+		h->uc_all++;
 	}
 	log_copy(h->line[h->pos], line, len);
 	h->pos = (h->pos + 1) % SWEETLOG_HITS;
@@ -702,9 +737,37 @@ sweet_log_dump(void)
 	}
 	log_line(&st_log);	/* final unterminated line */
 
-	con_str("LOG", "backboardd Metal plugin lines (newest 12):");
+	con_str("LOG", "SweetAccel windows (0144):");
 	{
-		unsigned show = st_log.hits.nbbd < 12 ? st_log.hits.nbbd : 12;
+		char text[48], *p = text;
+		const char *a = "all lines ";
+		while ((*p = *a++))
+			p++;
+		p = log_dec(p, st_log.hits.mtl_all);
+		*p = 0;
+		con_skip();
+		con_text(text);
+	}
+	{
+		unsigned show = st_log.hits.nmtlbbd < 2 ? st_log.hits.nmtlbbd : 2;
+		for (unsigned i = 0; i < show; i++) {
+			unsigned idx = (st_log.hits.posmtlbbd + 2 - show + i) % 2;
+			con_skip();
+			con_text(st_log.hits.mtlbbd[idx]);
+		}
+	}
+	{
+		unsigned show = st_log.hits.nmtl < 6 ? st_log.hits.nmtl : 6;
+		for (unsigned i = 0; i < show; i++) {
+			unsigned idx = (st_log.hits.posmtl + 12 - show + i) % 12;
+			con_skip();
+			con_text(st_log.hits.mtl[idx]);
+		}
+	}
+	con_skip();
+	con_str("LOG", "backboardd Metal plugin lines (newest 4):");
+	{
+		unsigned show = st_log.hits.nbbd < 4 ? st_log.hits.nbbd : 4;
 		for (unsigned i = 0; i < show; i++) {
 			unsigned idx = (st_log.hits.posbbd + 12 - show + i) % 12;
 			con_skip();
@@ -759,13 +822,23 @@ sweet_log_dump(void)
 		}
 	}
 	con_skip();
-	con_str("LOG", "Metal telemetry (newest 8, row only):");
+	con_str("LOG", "RedwoodGPU user client (0261):");
 	{
-		unsigned show = st_log.hits.ntel < 8 ? st_log.hits.ntel : 8;
+		char text[48], *p = text;
+		const char *a = "all lines ";
+		while ((*p = *a++))
+			p++;
+		p = log_dec(p, st_log.hits.uc_all);
+		*p = 0;
+		con_skip();
+		con_text(text);
+	}
+	{
+		unsigned show = st_log.hits.nuc < 6 ? st_log.hits.nuc : 6;
 		for (unsigned i = 0; i < show; i++) {
-			unsigned idx = (st_log.hits.postel + 56 - show + i) % 56;
+			unsigned idx = (st_log.hits.posuc + 8 - show + i) % 8;
 			con_skip();
-			con_text(log_tel_body(st_log.hits.tel[idx]));
+			con_text(st_log.hits.uc[idx]);
 		}
 	}
 	con_skip();
