@@ -395,7 +395,18 @@ void shim_main(uint64_t dtb)
 	con_clear(RED);
 	con_str("SHIM", "sweet milestone 4: xnu loader");
 	con_str("BOARD", BOARD_NAME);
+	/* Pointer authentication capability: APA (bits 7:4) and API (bits 11:8)
+	 * of ID_AA64ISAR1_EL1. 0 = not implemented, 1 = implemented (QARMA). */
+	uint64_t isar1 = rsr("id_aa64isar1_el1");
+	con_hex2("ISAR1", "lo=", (uint32_t)isar1, "hi=", (uint32_t)(isar1 >> 32));
+	con_hex2("PAC", "APA=", (isar1 >> 4) & 0xf, "API=", (isar1 >> 8) & 0xf);
 	con_skip();
+#if defined(PAC_PROBE)
+	/* Diagnostic image: keep the answer on screen and stop here. */
+	con_str("PROBE", "PAC check done, reset in ~10 min");
+	delay_ms(600000);
+	reset(20);
+#endif
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();
@@ -405,10 +416,13 @@ void shim_main(uint64_t dtb)
 	 * previous boot left at the end of userdata and keep it on screen. */
 	if (str_same(why, "no SWEETXNU payload")) {
 		con_clear(BLACK);
+		con_capture_begin();
 		sweet_log_dump();
 		con_skip();
-		con_str("LOG", "reset in ~10 min");
-		delay_ms(600000);
+		con_str("LOG", "pages repeat twice, then reset");
+		/* 47 rows of 45 columns per page, 20 s each: long enough to photograph. */
+		con_capture_show(47, 20000, 2);
+		delay_ms(60000);
 		reset(20);
 	}
 #endif

@@ -1,4 +1,47 @@
-# Active handoff — graphics: Metal runs, ~31 fps and 0.5-4.6 s frame stalls (2026-11-12, opencode)
+# Active handoff — graphics: backboardd finally opens Metal; lag is now the present path (2026-11-13, opencode)
+
+- **`0259` fixed the CPU-compositing blocker.** Boot `shim/out/ios16-boot-gpu1-t.img` (sha256
+  `7055b3ae…`, kernel from CI run `43459989745`) + the flashed root: the dump shows
+  `MTL2[58 backboardd]: RedwoodGPU ready after 0 s: opening Metal…`, `refused 0, opened 11`,
+  `CPU-copied Metal frames 0`, and the user sees **the dock blur again** ("знову назад з'явився блюр доку").
+  So CoreAnimation now composites on the GPU; the old "Windows without a graphics driver" state is gone.
+  The user still calls it not smooth ("як плавності не було, так і нема") — this is a different, present-path
+  problem now, not a missing device.
+- **The wait works, but its timings do not add up — treat 0259's clock marks as unreliable.**
+  `SWEET GPU: RedwoodGPU registered before userspace (94188 ms waited, boot 1878.845 s)`,
+  `stages 1-10 done at 1878.826 s`, `backend and RedwoodGPU published at 1878.828 s`. A boot cannot be at
+  1878 s and userspace started 17 ms after publication, so `clock_get_uptime()`/`absolutetime_to_nanoseconds`
+  in this port do not return time-since-boot (the offsets may come from the ABL/CNTVCT not being reset, plus
+  `sweettime`); only the 2 ms difference between the two marks is trustworthy. What *is* real: the loop ran
+  4709 iterations and ended exactly when the service appeared, while the earlier 30 s cap (`0258`) expired
+  first — so `IOSleep(20)` sleeps far less than 20 ms this early in boot, and the success of `0259` is
+  accidental (120 s of budget outlasted the real bring-up, ~2 s). Boot felt normal length to the user in
+  both cases, which rules out any real 30-94 s wait.
+- **Next kernel change (`0260`, drafted in `%TEMP%\opencode\0260-draft.patch`, not yet committed):**
+  replace `IOSleep(20)` with `delay(20000)` (busy-wait on the timebase; the same `delay()` the UFS driver
+  already uses), so the wait is a real 20 ms per iteration and ~2 s total instead of an accidental spin.
+- **New: paged dump (works, no transcription).** `shim/ufs.c` + `shim/console.c` now capture the whole dump
+  into lines and paint it as pages of 47 rows x 45 columns, **20 s per page, two passes**, header
+  `PAGE n/m` — photograph each page instead of reading it out. `logdump-gpu.img` sha256 `97c67300…`;
+  a host test (`console.c` + a throwaway `pagetest.c`) verified pages/rows. The dump now also shows the
+  `tel` telemetry rows (newest 8) and more of each ring (12 plugin lines, 8 Metal users, 4 results, 4 fb
+  windows, 6 marks, 6 IOK lines, 4 kernel GPU lines). `shim/build.sh` host build must keep working:
+  the pager's `cntfrq_el0` wait is `#if defined(__aarch64__)`.
+- Boot stats of the `0259` boot (software blur no longer, GPU compositing yes): `swap gaps <17 ms 298,
+  <34 24, <50 3, more 17`, `GPU busy 59%`, `SwapWait 668 (timed out 4)`, `vsyncs sent 0`,
+  `display-time samples: game layer 338 frames, black`, `black 78`. Metal users: chronod 5, PosterBoard 3,
+  PridePosterExtension 3, AegirPoster 9, WebKit 3.
+- **Next, in this order:**
+  1. Boot `logdump-gpu.img` (`97c67300…`), photograph all pages: `tel` rows, all `SWEET FB` windows and the
+     `GPU users` histogram say whether backboardd itself commits frames now (it is absent from the list
+     above, which is suspicious: only poster extensions, chronod and WebKit appear).
+  2. If backboardd is still not the committer, the next lever is the plugin/present path (drawable wait,
+     `SwapWait`), not the GPU: compare `tel` pipeline/wait/commit numbers with the `SWEET FB` swap gaps.
+  3. Then `0260` (deterministic ~2 s wait) to stop relying on the accidental spin, and only after that
+     re-test `sweetfb_scale=2`, dock blur, colours (`sweetmtlwait=0` boot `9d3b419f…` had broken colours
+     and no blur, and it is *not* the fix).
+
+# Previous handoff — graphics: Metal runs, ~31 fps and 0.5-4.6 s frame stalls (2026-11-12, opencode)
 
 - **Metal works end to end now.** `guac-artifacts/ios16-root-gpu.simg` (12 177 438 940 B, sha256
   `fd14beed…`) flashed to `userdata`; boot images `shim/out/ios16-boot-gpu1-clean.img` (60 Hz) and

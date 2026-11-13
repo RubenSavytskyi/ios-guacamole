@@ -326,6 +326,13 @@ struct log_hits {
 	/* the tail of the kernel's GPU bring-up: was RedwoodGPU registered before userspace? */
 	char kw[4][SWEETLOG_LINE];
 	unsigned nkw, poskw;
+	/*
+	 * 0259: the bring-up's own clock marks. "SWEET GPU" lines are dozens per boot (one or more per
+	 * stage), so the kw ring above holds only the newest four; these two marks are what says how
+	 * long stages 1-10 really take.
+	 */
+	char tm[6][SWEETLOG_LINE];
+	unsigned ntm, postm;
 	/* the newest "native-metal:" lines: per-frame bridge activity, whoever's drawing */
 	char nm[8][SWEETLOG_LINE];
 	unsigned nnm, posnm;
@@ -494,6 +501,14 @@ static void log_hit(struct log_hits *h, const char *line, unsigned len)
 		h->poskw = (h->poskw + 1) % 4;
 		if (h->nkw < 4)
 			h->nkw++;
+	}
+	/* 0259: the timing marks, kept out of that ring so the stage flood cannot push them out */
+	if (has_word(line, "stages 1-10 done") || has_word(line, "RedwoodGPU published at") ||
+	    has_word(line, "GPU wait:")) {
+		log_copy(h->tm[h->postm], line, len);
+		h->postm = (h->postm + 1) % 6;
+		if (h->ntm < 6)
+			h->ntm++;
 	}
 	if (has_word(line, "native-metal")) {
 		log_copy(h->nm[h->posnm], line, len);
@@ -687,9 +702,9 @@ sweet_log_dump(void)
 	}
 	log_line(&st_log);	/* final unterminated line */
 
-	con_str("LOG", "backboardd Metal plugin lines (newest 5):");
+	con_str("LOG", "backboardd Metal plugin lines (newest 12):");
 	{
-		unsigned show = st_log.hits.nbbd < 5 ? st_log.hits.nbbd : 5;
+		unsigned show = st_log.hits.nbbd < 12 ? st_log.hits.nbbd : 12;
 		for (unsigned i = 0; i < show; i++) {
 			unsigned idx = (st_log.hits.posbbd + 12 - show + i) % 12;
 			con_skip();
@@ -699,7 +714,7 @@ sweet_log_dump(void)
 	con_skip();
 	con_str("LOG", "GPU users (native-metal work commits):");
 	{
-		unsigned show = st_log.hits.nwho < 5 ? st_log.hits.nwho : 5;
+		unsigned show = st_log.hits.nwho < 8 ? st_log.hits.nwho : 8;
 		for (unsigned i = 0; i < show; i++) {
 			char text[48], *p = text;
 			const char *a = st_log.hits.who[i];
@@ -734,9 +749,9 @@ sweet_log_dump(void)
 		*p = 0;
 		con_str("LOG", text);
 	}
-	con_str("LOG", "Metal results (newest 2):");
+	con_str("LOG", "Metal results (newest 4):");
 	{
-		unsigned show = st_log.hits.nres < 2 ? st_log.hits.nres : 2;
+		unsigned show = st_log.hits.nres < 4 ? st_log.hits.nres : 4;
 		for (unsigned i = 0; i < show; i++) {
 			unsigned idx = (st_log.hits.posres + 8 - show + i) % 8;
 			con_skip();
@@ -744,9 +759,19 @@ sweet_log_dump(void)
 		}
 	}
 	con_skip();
+	con_str("LOG", "Metal telemetry (newest 8, row only):");
+	{
+		unsigned show = st_log.hits.ntel < 8 ? st_log.hits.ntel : 8;
+		for (unsigned i = 0; i < show; i++) {
+			unsigned idx = (st_log.hits.postel + 56 - show + i) % 56;
+			con_skip();
+			con_text(log_tel_body(st_log.hits.tel[idx]));
+		}
+	}
+	con_skip();
 	con_str("LOG", "framebuffer stats (newest 3):");
 	{
-		unsigned show = st_log.hits.nfb < 3 ? st_log.hits.nfb : 3;
+		unsigned show = st_log.hits.nfb < 4 ? st_log.hits.nfb : 4;
 		for (unsigned i = 0; i < show; i++) {
 			unsigned idx = (st_log.hits.posfb + 8 - show + i) % 8;
 			con_skip();
@@ -761,9 +786,25 @@ sweet_log_dump(void)
 		con_text(st_log.hits.wait2[idx]);
 	}
 	con_skip();
+	con_str("LOG", "bring-up timing marks (0259):");
+	{
+		unsigned show = st_log.hits.ntm < 6 ? st_log.hits.ntm : 6;
+		for (unsigned i = 0; i < show; i++) {
+			unsigned idx = (st_log.hits.postm + 6 - show + i) % 6;
+			const char *s = st_log.hits.tm[idx];
+			unsigned n = 0;
+			while (s[n])
+				n++;
+			if (n > 115)
+				s += n - 115;
+			con_skip();
+			con_text(s);
+		}
+	}
+	con_skip();
 	con_str("LOG", "backboardd registry trace (newest 3, tail):");
 	{
-		unsigned show = st_log.hits.niokt < 3 ? st_log.hits.niokt : 3;
+		unsigned show = st_log.hits.niokt < 6 ? st_log.hits.niokt : 6;
 		for (unsigned i = 0; i < show; i++) {
 			unsigned idx = (st_log.hits.posiokt + 6 - show + i) % 6;
 			const char *s = st_log.hits.iokt[idx];
@@ -779,7 +820,7 @@ sweet_log_dump(void)
 	con_skip();
 	con_str("LOG", "kernel GPU lines (newest 3, tail):");
 	{
-		unsigned show = st_log.hits.nkw < 3 ? st_log.hits.nkw : 3;
+		unsigned show = st_log.hits.nkw < 4 ? st_log.hits.nkw : 4;
 		for (unsigned i = 0; i < show; i++) {
 			unsigned idx = (st_log.hits.poskw + 4 - show + i) % 4;
 			const char *s = st_log.hits.kw[idx];

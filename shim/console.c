@@ -61,13 +61,144 @@ static void fmt_hex(char *buf, uint64_t v, int digits)
 	buf[digits] = 0;
 }
 
+/* * * * * * * * * * * * * * * *
+ * Capture: the same text, but kept as finished screen rows (see console.h).
+ */
+#define CAP_LINES	400
+#define CAP_COLS	64
+
+static char cap[CAP_LINES][CAP_COLS];
+static unsigned ncap, cap_col;
+static int capturing;
+
+static void cap_newline(void)
+{
+	if (ncap + 1 >= CAP_LINES)
+		return;
+	ncap++;
+	cap[ncap][0] = 0;
+	cap_col = 0;
+}
+
+static void cap_putc(char c)
+{
+	if (c == '\r')
+		return;
+	if (c == '\n') {
+		cap_newline();
+		return;
+	}
+	if (cap_col >= (unsigned)(FB_W / CH_W))
+		cap_newline();
+	if (cap_col + 1 < CAP_COLS) {
+		cap[ncap][cap_col++] = c;
+		cap[ncap][cap_col] = 0;
+	}
+}
+
+static void cap_puts(const char *s)
+{
+	while (*s)
+		cap_putc(*s++);
+}
+
+void con_capture_begin(void)
+{
+	ncap = 0;
+	cap_col = 0;
+	cap[0][0] = 0;
+	capturing = 1;
+}
+
+static void wait_ms(unsigned ms)
+{
+#if defined(__aarch64__)
+	uint64_t freq = 0, start = 0, now = 0, ticks;
+
+	__asm__ volatile("isb; mrs %0, cntfrq_el0" : "=r"(freq));
+	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(start));
+	ticks = freq / 1000ull * ms;
+	do {
+		__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(now));
+	} while (now - start < ticks);
+#else
+	(void)ms;	/* host_test: no pager, the layout is what matters */
+#endif
+}
+
+void con_capture_show(unsigned rows, unsigned hold_ms, unsigned passes)
+{
+	static const char hex[] = "0123456789";
+	const unsigned maxrows = (unsigned)(FB_H / CH_H);
+	unsigned pages;
+	char hdr[CAP_COLS];
+
+	if (rows == 0 || rows > maxrows - 1)
+		rows = maxrows - 1;
+	if (cap_col > 0)
+		cap_newline();
+	if (ncap == 0 || passes == 0)
+		return;
+	pages = (ncap + rows - 1) / rows;
+
+	for (unsigned p = 0; p < passes; p++) {
+		for (unsigned pg = 0; pg < pages; pg++) {
+			unsigned i = 0;
+
+			capturing = 0;	/* draw, do not record the page header itself */
+			con_clear(BLACK);
+			{
+				char tmp[8];
+				int n = 0, col = 0;
+				unsigned v = pg + 1;
+
+				while (v) {
+					tmp[n++] = hex[v % 10];
+					v /= 10;
+				}
+				while (n)
+					hdr[col++] = tmp[--n];
+				hdr[col++] = '/';
+				v = pages;
+				n = 0;
+				while (v) {
+					tmp[n++] = hex[v % 10];
+					v /= 10;
+				}
+				while (n)
+					hdr[col++] = tmp[--n];
+				hdr[col] = 0;
+			}
+			con_str("PAGE", hdr);
+			for (unsigned li = pg * rows; li < (pg + 1) * rows && li < ncap; li++, i++) {
+				put_str(0, cap[li], WHITE);
+				row++;
+			}
+			wait_ms(hold_ms);
+		}
+	}
+	capturing = 0;
+}
+
 void con_skip(void)
 {
+	if (capturing) {
+		cap_newline();
+		return;
+	}
 	row++;
 }
 
 void con_str(const char *label, const char *s)
 {
+	if (capturing) {
+		cap_puts(label);
+		while (cap_col < LABEL_COLS)
+			cap_putc(' ');
+		cap_puts(s);
+		cap_newline();
+		return;
+	}
 	put_str(0, label, YELLOW);
 	put_str(LABEL_COLS, s, WHITE);
 	row++;
@@ -80,6 +211,12 @@ void con_text(const char *s)
 	const int maxrow = FB_H / CH_H;
 	int col = 0;
 
+	if (capturing) {
+		while (*s)
+			cap_putc(*s++);
+		cap_newline();
+		return;
+	}
 	while (*s) {
 		char ch = *s++;
 		if (ch == '\r') {
@@ -111,6 +248,23 @@ void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint
 {
 	char buf[9];
 	int col = put_str(0, label, YELLOW);
+
+	if (capturing) {
+		cap_puts(label);
+		while (cap_col < LABEL_COLS)
+			cap_putc(' ');
+		cap_puts(a);
+		fmt_hex(buf, va, 8);
+		cap_puts(buf);
+		if (b) {
+			cap_putc(' ');
+			cap_puts(b);
+			fmt_hex(buf, vb, 8);
+			cap_puts(buf);
+		}
+		cap_newline();
+		return;
+	}
 	col = col < LABEL_COLS ? LABEL_COLS : col + 1;
 	col = put_str(col, a, YELLOW);
 	fmt_hex(buf, va, 8);

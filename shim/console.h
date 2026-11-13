@@ -22,3 +22,13 @@ void con_text(const char *s);
 void con_hex(const char *label, uint64_t v);
 /* label, then "a=xxxxxxxx b=xxxxxxxx" style pairs of 32-bit values */
 void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint32_t vb);
+
+/*
+ * The screen holds only 45 columns x 50 rows at SCALE 3, so a full dump shows
+ * three or four screens' worth. With capture on, everything con_* draws is
+ * recorded instead (wrapped exactly as it would be drawn) and con_capture_show()
+ * then paints it as pages that change by themselves, so each page can simply be
+ * photographed. con_capture_show() returns after `passes` runs through all pages.
+ */
+void con_capture_begin(void);
+void con_capture_show(unsigned rows, unsigned hold_ms, unsigned passes);

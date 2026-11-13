@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 CC=aarch64-linux-gnu-gcc
 OBJCOPY=aarch64-linux-gnu-objcopy
-CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
+CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra ${EXTRA_CFLAGS:-}"
 # BOARD=guacamole ./build.sh  -> OnePlus 7 Pro (see board.h); default sweet.
 BOARD=${BOARD:-sweet}
 case "$BOARD" in
