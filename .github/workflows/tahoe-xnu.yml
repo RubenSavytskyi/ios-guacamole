@@ -36,7 +36,8 @@ jobs:
           git init -q dxb
           git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
           git -C dxb checkout -q FETCH_HEAD
-          cp xnu/patches/tahoe/*.patch dxb/patches/
+          mkdir -p dxb/patches/26.0
+          cp xnu/patches/tahoe/*.patch dxb/patches/26.0/
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
           ls dxb/patches

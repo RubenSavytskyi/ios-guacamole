@@ -3492,3 +3492,7 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - Extracted System/Library/KernelCollections/BootKernelExtensions.kc (67,551,232 bytes); Mach-O header is valid. SystemOS is a separate Cryptex; dyld cache extraction remains outstanding.
 - Added dedicated manual workflow .github/workflows/tahoe-xnu.yml and copied four validated XNU 12377 SWEET P0 patches to xnu/patches/tahoe/. It builds DEVELOPMENT arm64 against macOS 26.5 KDK.
 - Next: commit and dispatch this isolated workflow, fix errors from CI, then extract Tahoe Cryptex content and continue toward a temporary boot image. No Tahoe kernel/boot image exists yet; do not flash partitions.
+
+- Mounted SystemOS with local WSL apfs-fuse at /tmp/tahoe-systemos. Found dyld_shared_cache_arm64e for macOS 26.5 with 12 subcaches and copied all 5,804,413,663 bytes into tools/tahoe-26.5-extracted/dyld-arm64e/. ipsw dyld info parses it as macOS 26.5, 3,646 images.
+- GitHub Actions was re-enabled for the fork from the repository UI after verifying there were no scheduled workflows. Run 44192781405 downloaded the 26.5 KDK and reached XNU make, but failed with `Unsupported CURRENT_MACHINE_CONFIG SWEET`.
+- Root cause: the pinned build driver only reads patches from `patches/26.0` for macOS 26.5. The first workflow put SWEET patches in `patches/`, so none were applied. Workflow now puts them in the correct version directory; rerun and inspect compiler errors. No Tahoe kernel/boot image exists yet; do not flash partitions.
