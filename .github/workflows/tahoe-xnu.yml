@@ -7,6 +7,11 @@ on:
         description: Collect all compiler errors in one run
         type: boolean
         default: true
+  push:
+    branches: [guacamole-touch]
+    paths:
+      - ".github/workflows/tahoe-xnu.yml"
+      - "xnu/patches/tahoe/**"
 
 concurrency:
   group: tahoe-xnu-${{ github.ref }}
