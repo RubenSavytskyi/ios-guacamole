@@ -3484,3 +3484,11 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - Completed the iOS 16.7.16 / 20H392 disassembly in `research/haptics/ios-i/RESULTS.md`.
 - Both VibeSynth and Core Haptics ultimately consult `DeviceSupportsClosedLoopHaptics`. VibeSynth also has a legacy CoreAudio `vibe` device fallback only when that answer is false. It caches its capability once. Kernel 0251 does not participate in either check.
 - To preserve both MG answers, disabling `libVibeSynthEngine.dylib` loading is the reversible way to force MediaExperience back to its IOKit `vibrator` fallback; SpringBoard’s independent UIKit level-2 gate is `DisableLevel2Feedback` (preference storage/write path not verified). See results for limits and caveats. No phone changes made.
+
+# Tahoe 26.5 / XNU 12377 handoff (2026-11-17)
+
+- Current bring-up goal: macOS Tahoe on OnePlus 7 Pro (SM8150/guacamole). No partitions modified; device last confirmed unlocked in fastboot.
+- Recovered and CRC-verified the FileSystem AEA payload, decrypted to tools/tahoe-26.5-extracted/094-56453-087.dmg (13,071,548,416 bytes). Patched read-only APFS parser enumerates 563,747 inodes in Macintosh HD.
+- Extracted System/Library/KernelCollections/BootKernelExtensions.kc (67,551,232 bytes); Mach-O header is valid. SystemOS is a separate Cryptex; dyld cache extraction remains outstanding.
+- Added dedicated manual workflow .github/workflows/tahoe-xnu.yml and copied four validated XNU 12377 SWEET P0 patches to xnu/patches/tahoe/. It builds DEVELOPMENT arm64 against macOS 26.5 KDK.
+- Next: commit and dispatch this isolated workflow, fix errors from CI, then extract Tahoe Cryptex content and continue toward a temporary boot image. No Tahoe kernel/boot image exists yet; do not flash partitions.

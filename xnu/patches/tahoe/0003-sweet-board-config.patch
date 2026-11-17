@@ -1,0 +1,31 @@
+diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
+index 5a6cd33..b6ec0b8 100644
+--- a/pexpert/pexpert/arm64/board_config.h
++++ b/pexpert/pexpert/arm64/board_config.h
+@@ -319,6 +319,26 @@
+ #endif  /* ARM64_BOARD_CONFIG_VMAPPLE */
+ 
+ 
++#ifdef ARM64_BOARD_CONFIG_SWEET
++#include <pexpert/arm64/SWEET.h>
++
++/*
++ * Qualcomm Kryo 485 (SM8150): 4x Cortex-A76 (cluster 0) + 4x Cortex-A55
++ * (cluster 1). Both clusters have 64-byte L1/L2 lines, so MAX_L2_CLINE is 6.
++ * No APPLEARMSMP: the secondary cores are not started through Apple's
++ * mailbox; there is no Apple platform error handler either.
++ */
++#define MAX_L2_CLINE                   6
++#define MAX_CPUS                       8
++#define MAX_CPU_CLUSTERS               2
++
++#define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
++
++#define NO_XNU_PLATFORM_ERROR_HANDLER  1
++
++#endif  /* ARM64_BOARD_CONFIG_SWEET */
++
++
+ 
+ #ifndef HAS_UNCORE_CTRS
+ #undef UNCORE_VERSION
