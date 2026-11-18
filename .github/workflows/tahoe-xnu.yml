@@ -78,7 +78,11 @@ jobs:
         working-directory: dxb
         env:
           MAKEFLAGS: ${{ (github.event_name != 'workflow_dispatch' || inputs.keep_going) && '-k' || '' }}
-        run: bash build.sh 2>&1 | tee build.log
+        run: |
+          # Without pipefail, tee masks a failing build.sh and the step goes
+          # green with no kernel (run 44271872336 did exactly that).
+          set -o pipefail
+          bash build.sh 2>&1 | tee build.log
 
       - name: Collect kernel and build context
         if: always()
@@ -93,7 +97,8 @@ jobs:
             file "out/$(basename "$KERNEL")" || true
             lipo -info "out/$(basename "$KERNEL")" || true
           else
-            echo "no kernel.development.* was produced"
+            echo "::error::no kernel.development.* was produced"
+            exit 1
           fi
           SDK=$(xcrun --sdk macosx --show-sdk-path)
           mkdir -p sdk-kernel-platform

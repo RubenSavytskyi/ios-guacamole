@@ -1,0 +1,17 @@
+diff --git a/pexpert/pexpert/arm64/apple_arm64_cpu.h b/pexpert/pexpert/arm64/apple_arm64_cpu.h
+index e462ede..989ce16 100644
+--- a/pexpert/pexpert/arm64/apple_arm64_cpu.h
++++ b/pexpert/pexpert/arm64/apple_arm64_cpu.h
+@@ -32,6 +32,12 @@
+ 
+ #include <stdbool.h>
+ #include <sys/cdefs.h>
++/*
++ * SWEET (and any non-Apple board) does not include apple_arm64_common.h,
++ * so the MPIDR_CORETYPE_* fields used by arm64_core_type() below are not
++ * visible here. Pull them in directly instead of relying on include order.
++ */
++#include <pexpert/arm64/apple_arm64_regs.h>
+ 
+ /**
+  * Defines the core type of the executing CPU.
