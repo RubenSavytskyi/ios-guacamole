@@ -23,3 +23,6 @@ work/
 launchd.plist.*
 *.tmp
 _to_delete/
+# downloaded CI logs / run artifacts (large, regenerable)
+tools/tahoe-xnu-*.zip
+tools/tahoe-xnu-run-*/

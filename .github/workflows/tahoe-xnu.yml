@@ -38,8 +38,8 @@ jobs:
           git -C dxb checkout -q FETCH_HEAD
           mkdir -p dxb/patches/26.0
           cp xnu/patches/tahoe/*.patch dxb/patches/26.0/
-          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
-          grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64" VALID_ARCHS="x86_64 arm64"/' dxb/build.sh
+          grep -c 'ARCHS="x86_64 arm64"' dxb/build.sh
           ls dxb/patches
 
       - name: Dependencies and Xcode
@@ -48,30 +48,60 @@ jobs:
           printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
           sudo chmod +x /usr/local/bin/xcodes
           sw_vers
-          XC=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          # Explicit, non-beta Xcode 26.x. Do not use `sort | tail`: that
+          # silently picks a beta/RC or an unexpected version.
+          XC=""
+          for CAND in \
+            /Applications/Xcode_26.5.app \
+            /Applications/Xcode_26.5.0.app \
+            /Applications/Xcode_26.4.1.app \
+            /Applications/Xcode_26.3.0.app \
+            /Applications/Xcode_26.3.app; do
+            if [ -d "$CAND" ]; then XC="$CAND"; break; fi
+          done
+          if [ -z "$XC" ]; then
+            echo "No Xcode 26.x found. Installed:"; ls -d /Applications/Xcode*.app
+            exit 1
+          fi
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
           sudo xcode-select -s "$XC"
           xcodebuild -version
+          SDKVER=$(xcrun --sdk macosx --show-sdk-version)
+          echo "macOS SDK version: $SDKVER"
+          case "$SDKVER" in
+            26.*) ;;
+            *) echo "Expected an SDK starting with 26, got $SDKVER"; exit 1 ;;
+          esac
           xcrun --find iig
 
       - name: Build XNU 12377 for SWEET
         working-directory: dxb
         env:
-          MAKEFLAGS: ${{ inputs.keep_going && '-k' || '' }}
-        run: bash build.sh
+          MAKEFLAGS: ${{ (github.event_name != 'workflow_dispatch' || inputs.keep_going) && '-k' || '' }}
+        run: bash build.sh 2>&1 | tee build.log
 
       - name: Collect kernel and build context
         if: always()
         run: |
           mkdir -p out
           cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          KERNEL=$( { find dxb/build dxb/fakeroot -name '*.dSYM' -prune -o \
+            -type f -name 'kernel.development.*' -print 2>/dev/null || true; } | head -1 )
+          if [ -n "$KERNEL" ]; then
+            cp "$KERNEL" out/
+            echo "kernel: $KERNEL"
+            file "out/$(basename "$KERNEL")" || true
+            lipo -info "out/$(basename "$KERNEL")" || true
+          else
+            echo "no kernel.development.* was produced"
+          fi
           SDK=$(xcrun --sdk macosx --show-sdk-path)
           mkdir -p sdk-kernel-platform
           cp -R "$SDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform" sdk-kernel-platform/ || true
           tar czf out/buildtree.tgz \
             --exclude='*.o' --exclude='*.cpo' --exclude='*.a' --exclude='*.dSYM' --exclude='*.unstripped' \
             --exclude='kernel.development.*' --exclude='.git' \
-            -C dxb build/xnu.obj fakeroot/usr/local/include xnu \
+            -C dxb build/xnu.obj fakeroot/usr/local/include xnu build.log \
             -C .. sdk-kernel-platform
           ls -la out
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
@@ -79,7 +109,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: tahoe-xnu-12377-sweet
+          name: xnu-buildtree
           path: out/
           if-no-files-found: warn
           retention-days: 7

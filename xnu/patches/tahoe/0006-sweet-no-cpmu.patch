@@ -1,0 +1,42 @@
+diff --git a/osfmk/arm64/cpc_arm64.c b/osfmk/arm64/cpc_arm64.c
+index b4ab324..da691b6 100644
+--- a/osfmk/arm64/cpc_arm64.c
++++ b/osfmk/arm64/cpc_arm64.c
+@@ -37,8 +37,9 @@
+ #include <kern/cpc_private.h>
+ #include <machine/machine_cpc.h>
+ 
+-#if defined(__BUILDING_XNU_LIB_UNITTEST__)
+-// CPC cannot program the CPMU's privileged MSRs from user space.
++#if defined(__BUILDING_XNU_LIB_UNITTEST__) || defined(SWEET)
++// CPC cannot program the CPMU's privileged MSRs from user space. SWEET
++// (Qualcomm SM8150) has no Apple CPMU at all, so it must never try either.
+ bool cpc_cpmu_supported = false;
+ #else
+ bool cpc_cpmu_supported = true;
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index 631b3d8..db0f4c8 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -34,6 +34,21 @@
+ 
+ #define HAS_GIC_V3                1
+ 
++/*
++ * SM8150 has an ARM PMU (PMCCNTR_EL0), not Apple's CPMU. The CPC data
++ * structures in cpc_arm64.h are sized with CPMU_PMC_COUNT, so keep the
++ * Apple SoC value; cpc_arm64.c marks the CPMU unsupported for SWEET and
++ * therefore never programs any of the Apple implementation-defined MSRs.
++ */
++#define CPMU_PMC_COUNT            10
++#define CPMU_INSTRUCTION_MATCHING 0
++#define CPMU_MEMORY_FILTERING     0
++#define CPMU_64BIT_PMCS           0
++#define CPMU_16BIT_EVENTS         0
++#define CPMU_EVENT_FILTERING      0
++#define CPMU_AIC_PMI              0
++#define HAS_CPMU_PC_CAPTURE       0
++
+ #ifndef ASSEMBLER
+ #define PLATFORM_PANIC_LOG_DISABLED
+ #endif /* ! ASSEMBLER */
