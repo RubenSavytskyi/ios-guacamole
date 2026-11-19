@@ -3516,3 +3516,43 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - [verified] The imported workflow differs from the one here in three places: it triggers on `patches/**`, copies `patches/*.patch` into `dxb/patches/26.0`, and additionally runs `ci/test_pac_count.py`/`ci/test_dsc_hist.py` plus `ci/pac_count.py` on any kernel it produces (criterion d). It also strips `arm64e` from the `installhdrs` ARCHS lines, not just `libfirehose_kernel`.
 - Two runs were in flight when the split happened: `44271872336` here (last run in this repo, tests the in-place workflow) and `44272486191` in `guacamole-xnu` (first run there). Treat `guacamole-xnu` as the source of truth from now on; the copies in `xnu/patches/tahoe/` are kept only as history until one of those runs proves the new repo builds identically.
 - Still true: no Tahoe kernel or boot image exists. Do not flash partitions.
+
+
+# Tahoe XNU CI: Run 44278053892, 0 compiler errors, patch 0008 (2026-11-18)
+
+- [verified] Run `44278053892` in `RubenSavytskyi/guacamole-xnu` (28m27s, `macos-15-intel`, Xcode 26.3.0, SDK 26.2):
+  - Thanks to `set -o pipefail`, the step failed cleanly on non-zero exit (code 2) instead of falsely passing.
+  - Complete log (947 MB) downloaded and analyzed:
+  - C/C++ compilation: **0 errors** across all 8 kernel components (`osfmk`, `bsd`, `libkern`, `iokit`, `pexpert`, `libsa`, `security`, `san`). Patch 0007 completely fixed the `MPIDR_CORETYPE_*` include bug.
+  - Generating `link.filelist` succeeded.
+  - Build failed at the final kernel linking step (`kernel.development.sweet.unstripped.noctf`):
+    `ld: library '/Library/Developer/KDKs/KDK_26.5_25F71.kdk//System/Library/KernelSupport/libSWEET.os.DEVELOPMENT.a' not found`
+    `clang++: error: linker command failed with exit code 1`.
+  - Criteria check: (a) no `-arch arm64e`, `-fptrauth`, `-mbranch-protection`, `+pauth` in compilation; (b) `CPU_HAS_APPLE_PAC` = 0; (c)/(d) not yet evaluated (kernel unlinked); (e) 0 compile errors, 1 link error.
+- [verified] Patch `0008-sweet-no-kdk-kernelsupport.patch` created: in `makedefs/MakeInc.def:1156`, changes `ifneq ($(CURRENT_MACHINE_CONFIG),NONE)` to `ifeq ($(filter NONE SWEET,$(CURRENT_MACHINE_CONFIG)),)`, matching akita's `SHENG` handling. Apple KDK only contains binary support archives for Apple silicon SoC families, not custom platforms.
+- [verified] Patches 0001–0008 apply cleanly in sequence against clean `xnu-12377.121.6` (`ac9718f`).
+- [verified] Workflow in `guacamole-xnu` updated so `build.log` and `buildtree.tgz` are packaged before failing on missing kernel, ensuring logs are preserved in artifacts on failure.
+- Patch 0008 mirrored to `guacamole-xnu/patches/`, `xnu-12377/patches/`, and `xnu/patches/tahoe/`.
+
+## Tahoe XNU CI: Run 44300012809 and patch 0008 format fix (2026-11-18)
+
+- [verified] Run `44300012809` in `guacamole-xnu` (28m25s):
+  - Workflow artifact fix succeeded: `xnu-buildtree` (106 MB) preserved `build.log` (727 MB) and `criteria.json` from `accept.py`.
+  - Criteria: (a) PASS, (b) PASS, (e) 0 C/C++ compilation errors across all 8 components.
+  - Link failed because patch 0008 was skipped by DXB: `[warning] Skipping patch .../0008-sweet-no-kdk-kernelsupport.patch (...): error: corrupt patch at line 13` due to a missing trailing diff context line.
+- [verified] Patch 0008 regenerated from clean `git diff` against `xnu-12377.121.6`; full sequence 0001–0008 verified with `git apply --check` and clean application.
+- Patch updated across all repositories.
+
+## Tahoe first-boot payload preflight (2026-11-19)
+
+- [verified] `guacamole-xnu` README audit committed as `c9a4d12` (`docs: record iOS 27 and shim format audits`).
+- [verified] Generated an uncommitted first-boot ADT from `tools/mkadt.py` using the guacamole geometry and high-memory window, retaining the existing D22AP / iPhone10,3 identity. The D22 source ADT at `research/ipsw-x/d22ap.adt` is absent, so `/product` was not emitted. Removed `/arm-io/wlan` and `/arm-io/bluetooth`; no GPU/haptic firmware nodes were present. This leaves Stage 4 untouched.
+- [verified] ADT `C:\Users\ruvim\Documents\MacOS OnePlus 7 Pro\tahoe-firstboot-d22.adt` is 10,220 bytes: `dram-base=0x100000000`, `dram-size=0xfcb00000`, eight CPU nodes, `/arm-io/gic` with two 64-bit `reg` ranges and virtual timer INTID 19, and `/pram` at `0x1fcb00000` size `0x100000`.
+- [verified] XNU 12377 `ml_parse_cpu_topology` reads `/cpus`, requires each selected CPU's `reg`, and honors `cpus=N`; `cluster-type=0` falls through to `CLUSTER_TYPE_SMP`. The parser derives physical cluster IDs from MPIDR `reg`; the supplied `cpu-id` and `cluster-id` properties do not drive that topology function. `pe_identify_machine` reads `/arm-io` `device_type`/`ranges` and clock properties from CPU nodes marked `state=running`.
+- [verified] Sweet `pe_init_fiq` reads `/arm-io/gic/reg` directly. The older generic `pe_arm_map_interrupt_controller` path separately looks for `interrupt-controller=master` and a `device_type=timer` node, neither of which the generated ADT has. Confirm whether that path matters for this Tahoe configuration before changing the ADT; the Sweet GIC path and timer INTID are already present.
+- [verified] `PE_init_platform` copies boot_args.Video and chosen properties; `PE_create_console` is called after `ml_parse_cpu_topology`. The stock 12377 `video_console` maps a nonzero physical framebuffer with `ml_io_map_unmappable`; if Video is empty it switches to serial mode. The shim does not use UEFI GOP: `loader.c` fills Video from the board's fixed framebuffer constants.
+- [verified] Boot arg `cpus=1` is parsed by `ml_parse_cpu_topology`. `wdt=-1` is recognized by scheduler-hygiene debug code, but is not proof that the ABL/SoC hardware watchdog is disabled. The public XNU runtime sources contain no `PE_parse_boot_argn` call for `-v`, so do not rely on `-v` alone for output.
+- [verified] XNU's `/pram` plus `/chosen/embedded-panic-log-size` is a 1 MiB embedded panic-log region outside the `dram-base`/`dram-size` kernel-managed range. The current shim has no readback path for it; retention across reset has not been tested.
+- [verified] Built `tahoe-firstboot-d22.payload` with `tools/mkpayload.py` from the successful run `44521215540` kernel and the generated ADT. It is a 23,744,112-byte `SWEETXNU` v1 payload, ten kernel segments, no chained fixups; args are `debug=0xc serial=3 -v cpus=1 keepsyms=1 wdt=-1`.
+- [verified] No `tools/mktripleboot.py` or `docs/dualboot.md` exists in this local checkout, and the remote branch could not be queried due to a network resolver failure. No triple image was produced and no device boot was run. `fastboot boot <triple.img>` and menu selection remain pending recovery of the triple-image builder and its format contract.
+- Patch 0015 was not created. First use the standard console path in the current kernel; consider an early framebuffer diagnostic patch only if the first hardware attempt is silent or fails before `PE_create_console`.
